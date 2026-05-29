@@ -229,18 +229,21 @@ sub restore_get_mechanism {
 
 sub restore_vm_init {
     my ($self, $volname) = @_;
-    $self->_log('info', "DpxPlugin: restore_vm_init volname=$volname");
+    $self->_log('info', "DpxPlugin: restore_vm_init volname=$volname storeid=" . ($self->{storeid} // 'undef'));
 
     my $resp = $self->{http}->post('/proxmox/restore/init', {
         volname     => $volname,
         pve_node_ip => $self->{node_ip},
+        storeid     => $self->{storeid},
     });
 
     my $session_id = $resp->{session_id}
         or die "DpxPlugin: no session_id in /proxmox/restore/init response";
 
-    $self->{restore_session_id} = $session_id;
-    $self->{restore_volname}    = $volname;
+    $self->{restore_session_id}   = $session_id;
+    $self->{restore_volname}      = $volname;
+    $self->{restore_guest_config} = $resp->{vm_config};
+    $self->_log('info', "DpxPlugin: vm_config received? " . (defined $resp->{vm_config} ? "yes (" . length($resp->{vm_config}) . " bytes)" : "no"));
 
     # The vmid is encoded in the volname: e.g. snap-<id>-vm-<vmid>.vma
     my $source_vmid = _parse_vmid_from_volname($volname);
@@ -312,27 +315,9 @@ sub restore_vm_cleanup {
 
 sub archive_get_guest_config {
     my ($self, $volname) = @_;
-    # Guest config is stored as vm-config.json in the backup directory
-    my $vmid = $self->{restore_source_vmid};
-    return undef unless defined $vmid;
-
-    my $storage_path = $self->{scfg}{path} // '';
-    my $config_path  = "$storage_path/vm-$vmid/vm-config.json";
-    return undef unless -r $config_path;
-
-    open(my $fh, '<', $config_path) or return undef;
-    local $/;
-    my $raw = <$fh>;
-    close $fh;
-
-    my $parsed = eval { decode_json($raw) };
-    return undef if $@;
-
-    if (ref($parsed) eq 'HASH' && exists $parsed->{vmConfig}) {
-        my $cfg = $parsed->{vmConfig};
-        return ref($cfg) ? encode_json($cfg) : $cfg;
-    }
-    return $raw;
+    # Guest config is delivered via the /proxmox/restore/init callback response
+    # and cached on $self by restore_vm_init.
+    return $self->{restore_guest_config};
 }
 
 sub archive_get_firewall_config {
@@ -346,12 +331,17 @@ sub archive_get_firewall_config {
 
 sub _parse_vmid_from_volname {
     my ($volname) = @_;
-    # Strip storage prefix and archive extension
+    # Strip optional storage prefix, leading backup/ dir, and archive extension.
     my $bare = $volname;
-    $bare =~ s{^[^:]+:backup/}{};
+    $bare =~ s{^[^:]+:}{};
+    $bare =~ s{^backup/}{};
     $bare =~ s{\.vma(?:\..+)?$}{};
-    # Expected: snap-<snapshotId>-vm-<vmid>
+    # snap-<snapshotId>-vm-<vmid>
     if ($bare =~ /-vm-(\d+)$/) {
+        return $1;
+    }
+    # vzdump-qemu-<vmid>(-<timestamp>)?
+    if ($bare =~ /^vzdump-qemu-(\d+)(?:-|$)/) {
         return $1;
     }
     die "DpxPlugin: cannot parse vmid from volname '$volname'";

@@ -20,8 +20,6 @@ sub plugindata {
     };
 }
 
-sub activate_storage   { return 1; }
-sub deactivate_storage { return 1; }
 sub activate_volume    { return 1; }
 sub deactivate_volume  { return 1; }
 sub list_volumes       { return []; }
