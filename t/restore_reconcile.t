@@ -23,22 +23,44 @@ require 'PVE/BackupProvider/Plugin/DpxPlugin.pm';
 
 my $reconcile = \&PVE::BackupProvider::Plugin::DpxPlugin::_reconcile_inventory;
 
-my $inv = $reconcile->([ { device => 'scsi0', size_bytes => 100 } ], { scsi0 => 100, foreign => 999 });
-is_deeply($inv, { scsi0 => { size => 100 } }, 'foreign img ignored, manifest disk kept');
+# image_name is authoritative: locate/key the disk by the on-disk image name.
+my $inv = $reconcile->(
+    [ { device => 'virtio0', image_name => 'drive-virtio0', size_bytes => 100 } ],
+    { 'drive-virtio0' => 100, 'foreign' => 5 },
+);
+is_deeply($inv, { 'drive-virtio0' => { size => 100 } },
+    'image_name used, keyed by on-disk image name, foreign ignored');
 
-eval { $reconcile->([ { device => 'scsi0', size_bytes => 100 } ], {}); };
-like($@, qr/missing/i, 'missing manifest disk dies');
+# Older RP without image_name: fall back to device (no prefix logic).
+my $inv2 = $reconcile->(
+    [ { device => 'scsi0', size_bytes => 7 } ],
+    { 'scsi0' => 7 },
+);
+is_deeply($inv2, { 'scsi0' => { size => 7 } },
+    'fallback to device when image_name absent');
 
-eval { $reconcile->([ { device => 'scsi0', size_bytes => 100 } ], { scsi0 => 64 }); };
+eval {
+    $reconcile->(
+        [ { device => 'virtio0', image_name => 'drive-virtio0', size_bytes => 100 } ],
+        {},
+    );
+};
+like($@, qr/missing/i, 'missing on disk dies');
+
+eval {
+    $reconcile->(
+        [ { device => 'virtio0', image_name => 'drive-virtio0', size_bytes => 100 } ],
+        { 'drive-virtio0' => 64 },
+    );
+};
 like($@, qr/size mismatch/i, 'size mismatch dies');
 
-eval { $reconcile->([ { device => 'scsi0' } ], { scsi0 => 100 }); };
+eval {
+    $reconcile->(
+        [ { device => 'virtio0', image_name => 'drive-virtio0' } ],
+        { 'drive-virtio0' => 100 },
+    );
+};
 like($@, qr/missing size/i, 'manifest disk without size dies');
-
-my $inv2 = $reconcile->([ { device => 'virtio0', size_bytes => 100 } ], { 'drive-virtio0' => 100, 'foreign' => 5 });
-is_deeply($inv2, { 'drive-virtio0' => { size => 100 } }, 'manifest virtio0 matches on-disk drive-virtio0, keyed by on-disk name');
-
-my $inv3 = $reconcile->([ { device => 'scsi0', size_bytes => 7 } ], { 'scsi0' => 7 });
-is_deeply($inv3, { 'scsi0' => { size => 7 } }, 'exact-name match still works');
 
 done_testing;

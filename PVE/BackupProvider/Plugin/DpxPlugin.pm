@@ -335,10 +335,10 @@ sub _assert_mounted {
 
 # Pure helper: strictly reconcile manifest disks (from the catalog recovery
 # point) against the *.img sizes found on disk.
-#   $manifest_disks: arrayref of { device => ..., size_bytes => ... } (also
-#                    accepts sizeBytes defensively)
-#   $fs_sizes:       hashref device => actual_size_on_disk
-# Returns inventory hashref { device => { size => actual } } or dies.
+#   $manifest_disks: arrayref of { device => ..., image_name => ..., size_bytes => ... }
+#                    (also accepts sizeBytes defensively)
+#   $fs_sizes:       hashref on-disk-image-name => actual_size_on_disk
+# Returns inventory hashref { image_name => { size => actual } } or dies.
 # Foreign *.img files present on disk but absent from the manifest are ignored.
 sub _reconcile_inventory {
     my ($manifest_disks, $fs_sizes) = @_;
@@ -350,20 +350,19 @@ sub _reconcile_inventory {
             unless defined $device;
         die "DpxPlugin: manifest disk '$device' missing size"
             unless defined $expected;
-        # PVE config keys are bare (e.g. 'virtio0') but the on-disk image is
-        # written as 'drive-virtio0.img'. Match either the bare device or the
-        # 'drive-'-prefixed on-disk key.
-        my $disk_key =
-              exists $fs_sizes->{$device}          ? $device
-            : exists $fs_sizes->{"drive-$device"}  ? "drive-$device"
-            : undef;
-        die "DpxPlugin: manifest disk '$device' missing on disk"
-            unless defined $disk_key;
-        my $actual = $fs_sizes->{$disk_key};
+        # image_name is the AUTHORITATIVE on-disk image device key from the
+        # recovery point (e.g. 'drive-virtio0'); the file is vm-<vmid>/<key>.img.
+        # Older recovery points lack it: fall back to the logical device slot.
+        my $key = (defined $disk->{image_name} && length $disk->{image_name})
+            ? $disk->{image_name}
+            : $device;
+        die "DpxPlugin: manifest disk '$device' (image '$key') missing on disk"
+            unless exists $fs_sizes->{$key};
+        my $actual = $fs_sizes->{$key};
         die "DpxPlugin: size mismatch for '$device' (manifest=$expected on-disk=$actual)"
             unless $actual == $expected;
-        # Key by the ON-DISK name so restore_vm_volume_init resolves the real file.
-        $inv{$disk_key} = { size => $actual + 0 };
+        # Key by the ON-DISK image name so restore_vm_volume_init resolves the real file.
+        $inv{$key} = { size => $actual + 0 };
     }
     return \%inv;
 }
