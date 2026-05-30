@@ -237,41 +237,48 @@ sub restore_vm_init {
         storeid     => $self->{storeid},
     });
 
+    die "DpxPlugin: /proxmox/restore/init did not return a JSON object"
+        unless ref($resp) eq 'HASH';
+
     my $session_id = $resp->{session_id}
         or die "DpxPlugin: no session_id in /proxmox/restore/init response";
+    die "DpxPlugin: no vmid in /proxmox/restore/init response"
+        unless defined $resp->{vmid};
+    die "DpxPlugin: no disks array in /proxmox/restore/init response"
+        unless ref($resp->{disks}) eq 'ARRAY';
+
+    my $source_vmid = $resp->{vmid};   # AUTHORITATIVE: from recovery point
 
     $self->{restore_session_id}   = $session_id;
     $self->{restore_volname}      = $volname;
     $self->{restore_guest_config} = $resp->{vm_config};
+    $self->{restore_source_vmid}  = $source_vmid;
     $self->_log('info', "DpxPlugin: vm_config received? " . (defined $resp->{vm_config} ? "yes (" . length($resp->{vm_config}) . " bytes)" : "no"));
-
-    # The vmid is encoded in the volname: e.g. snap-<id>-vm-<vmid>.vma
-    my $source_vmid = _parse_vmid_from_volname($volname);
-    $self->{restore_source_vmid} = $source_vmid;
-
     $self->_log('info', "DpxPlugin: restore session_id=$session_id vmid=$source_vmid");
 
-    # Discover disk inventory from the NFS-mounted path
     # The storage is NFS-backed via NFSPlugin; images live at $scfg->{path}/vm-<vmid>/
     my $storage_path = $self->{scfg}{path}
         or die "DpxPlugin: no path in scfg (NFS not mounted?)";
+    _assert_mounted($storage_path);
     my $vm_dir = "$storage_path/vm-$source_vmid";
 
-    my %inv;
+    # Collect on-disk *.img sizes, then strictly reconcile against the manifest.
+    my %fs_sizes;
     if (-d $vm_dir) {
         opendir(my $dh, $vm_dir) or die "cannot opendir $vm_dir: $!";
         while (my $entry = readdir($dh)) {
             next unless $entry =~ /^(.+)\.img$/;
             my $device = $1;
-            my $path   = "$vm_dir/$entry";
-            my @st = stat($path) or next;
-            $inv{$device} = { size => $st[7] + 0 };
+            my @st = stat("$vm_dir/$entry") or next;
+            $fs_sizes{$device} = $st[7] + 0;
         }
         closedir $dh;
     }
 
-    $self->_log('info', sprintf("DpxPlugin: restore inventory: %d disks", scalar keys %inv));
-    return \%inv;
+    my $inv = _reconcile_inventory($resp->{disks}, \%fs_sizes);
+
+    $self->_log('info', sprintf("DpxPlugin: restore inventory: %d disks", scalar keys %$inv));
+    return $inv;
 }
 
 sub restore_vm_volume_init {
@@ -328,6 +335,39 @@ sub archive_get_firewall_config {
 # -------------------------------------------------------------------------
 # Internal helpers
 # -------------------------------------------------------------------------
+
+sub _assert_mounted {
+    my ($path) = @_;
+    my $out = `findmnt --target "$path" 2>/dev/null`;
+    die "DpxPlugin: path '$path' is not a mountpoint (NFS not mounted?)"
+        unless defined $out && $out =~ /\S/;
+    return 1;
+}
+
+# Pure helper: strictly reconcile manifest disks (from the catalog recovery
+# point) against the *.img sizes found on disk.
+#   $manifest_disks: arrayref of { device => ..., size_bytes => ... } (also
+#                    accepts sizeBytes defensively)
+#   $fs_sizes:       hashref device => actual_size_on_disk
+# Returns inventory hashref { device => { size => actual } } or dies.
+# Foreign *.img files present on disk but absent from the manifest are ignored.
+sub _reconcile_inventory {
+    my ($manifest_disks, $fs_sizes) = @_;
+    my %inv;
+    for my $disk (@{$manifest_disks // []}) {
+        my $device = $disk->{device};
+        my $expected = $disk->{size_bytes} // $disk->{sizeBytes};
+        die "DpxPlugin: manifest disk missing device name"
+            unless defined $device;
+        die "DpxPlugin: manifest disk '$device' missing on disk"
+            unless exists $fs_sizes->{$device};
+        my $actual = $fs_sizes->{$device};
+        die "DpxPlugin: size mismatch for '$device' (manifest=$expected on-disk=$actual)"
+            unless $actual == $expected;
+        $inv{$device} = { size => $actual + 0 };
+    }
+    return \%inv;
+}
 
 sub _parse_vmid_from_volname {
     my ($volname) = @_;
