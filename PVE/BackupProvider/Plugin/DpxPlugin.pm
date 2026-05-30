@@ -350,12 +350,20 @@ sub _reconcile_inventory {
             unless defined $device;
         die "DpxPlugin: manifest disk '$device' missing size"
             unless defined $expected;
+        # PVE config keys are bare (e.g. 'virtio0') but the on-disk image is
+        # written as 'drive-virtio0.img'. Match either the bare device or the
+        # 'drive-'-prefixed on-disk key.
+        my $disk_key =
+              exists $fs_sizes->{$device}          ? $device
+            : exists $fs_sizes->{"drive-$device"}  ? "drive-$device"
+            : undef;
         die "DpxPlugin: manifest disk '$device' missing on disk"
-            unless exists $fs_sizes->{$device};
-        my $actual = $fs_sizes->{$device};
+            unless defined $disk_key;
+        my $actual = $fs_sizes->{$disk_key};
         die "DpxPlugin: size mismatch for '$device' (manifest=$expected on-disk=$actual)"
             unless $actual == $expected;
-        $inv{$device} = { size => $actual + 0 };
+        # Key by the ON-DISK name so restore_vm_volume_init resolves the real file.
+        $inv{$disk_key} = { size => $actual + 0 };
     }
     return \%inv;
 }

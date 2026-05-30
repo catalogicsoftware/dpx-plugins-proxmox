@@ -35,4 +35,10 @@ like($@, qr/size mismatch/i, 'size mismatch dies');
 eval { $reconcile->([ { device => 'scsi0' } ], { scsi0 => 100 }); };
 like($@, qr/missing size/i, 'manifest disk without size dies');
 
+my $inv2 = $reconcile->([ { device => 'virtio0', size_bytes => 100 } ], { 'drive-virtio0' => 100, 'foreign' => 5 });
+is_deeply($inv2, { 'drive-virtio0' => { size => 100 } }, 'manifest virtio0 matches on-disk drive-virtio0, keyed by on-disk name');
+
+my $inv3 = $reconcile->([ { device => 'scsi0', size_bytes => 7 } ], { 'scsi0' => 7 });
+is_deeply($inv3, { 'scsi0' => { size => 7 } }, 'exact-name match still works');
+
 done_testing;
