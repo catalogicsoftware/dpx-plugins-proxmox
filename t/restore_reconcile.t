@@ -32,4 +32,7 @@ like($@, qr/missing/i, 'missing manifest disk dies');
 eval { $reconcile->([ { device => 'scsi0', size_bytes => 100 } ], { scsi0 => 64 }); };
 like($@, qr/size mismatch/i, 'size mismatch dies');
 
+eval { $reconcile->([ { device => 'scsi0' } ], { scsi0 => 100 }); };
+like($@, qr/missing size/i, 'manifest disk without size dies');
+
 done_testing;

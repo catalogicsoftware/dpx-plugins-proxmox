@@ -31,8 +31,7 @@ sub new {
         http        => DpxVstor::HttpClient->new(endpoint => $endpoint),
         node_ip     => _resolve_node_ip(),
         job_token     => undef,
-        disk_stats    => {},   # device -> {extents_total, bytes_transferred, bytes_dirty}
-        archive_names => {},   # vmid -> archive name
+        disk_stats    => {},   # device -> bytes_written
     }, $class;
 }
 
@@ -85,10 +84,10 @@ sub job_cleanup {
     # Build disk map for job-done callback (keyed by device name)
     my %disks_map;
     for my $device (sort keys %{$self->{disk_stats}}) {
-        my $s = $self->{disk_stats}{$device};
+        my $bytes = $self->{disk_stats}{$device} + 0;
         $disks_map{$device} = {
-            bytesWritten => $s->{bytes_transferred} + 0,
-            fileSize     => $s->{bytes_transferred} + 0,
+            bytesWritten => $bytes,
+            fileSize     => $bytes,
         };
     }
 
@@ -107,7 +106,6 @@ sub job_cleanup {
 sub backup_init {
     my ($self, $vmid, $vmtype, $start_time) = @_;
     my $name = "vm-$vmid-" . ($start_time // time());
-    $self->{archive_names}->{$vmid} = $name;
     $self->_log('info', "DpxPlugin: backup_init vmid=$vmid archive=$name");
     return { 'archive-name' => $name };
 }
@@ -160,19 +158,17 @@ sub backup_vm {
             "DpxPlugin: backup_vm vmid=%s device=%s size=%s bitmap-mode=%s bitmap=%s action=%s",
             $vmid, $device, $size_bytes, $bitmap_mode, $bitmap_name, $transfer_action));
 
-        # Tell catalog this disk is starting
-        eval {
-            $self->{http}->post('/proxmox/callback/disk-start', {
-                token      => $token,
-                storeid    => $self->{storeid},
-                vmid       => $vmid + 0,
-                device     => $device,
-                bitmapMode => $bitmap_mode,
-                bitmapName => $bitmap_name,
-                sizeBytes  => $size_bytes + 0,
-            });
-        };
-        $self->_log('warn', "DpxPlugin: disk-start callback failed: $@") if $@;
+        # Tell catalog this disk is starting. The per-disk manifest depends on
+        # this callback, so a failure must fail the backup (no eval swallow).
+        $self->{http}->post('/proxmox/callback/disk-start', {
+            token      => $token,
+            storeid    => $self->{storeid},
+            vmid       => $vmid + 0,
+            device     => $device,
+            bitmapMode => $bitmap_mode,
+            bitmapName => $bitmap_name,
+            sizeBytes  => $size_bytes + 0,
+        });
 
         # Determine target path: under the NFS-mounted storage path
         # NFSPlugin mounts at $scfg->{path}; images go in vm-<vmid>/
@@ -184,7 +180,6 @@ sub backup_vm {
         make_path($target_dir) unless -d $target_dir;
 
         # Perform data transfer directly via UNIX socket
-        my $bytes_written = 0;
         eval {
             DpxVstor::NbdTransfer::copy(
                 socket_path => $socket_path,
@@ -195,24 +190,17 @@ sub backup_vm {
                 size_bytes  => $size_bytes,
                 log         => $self->{log},
             );
-            # Get written size from file
-            $bytes_written = -s $target_path // 0;
         };
         if ($@) {
             die "DpxPlugin: NbdTransfer failed for $device: $@";
         }
 
-        my $file_size = -s $target_path // 0;
+        my $bytes_written = -s $target_path // 0;
         $self->_log('info', sprintf(
-            "DpxPlugin: %s done bytes_written=%d file_size=%d",
-            $device, $bytes_written, $file_size));
+            "DpxPlugin: %s done bytes_written=%d", $device, $bytes_written));
 
         # Accumulate stats for job_cleanup
-        $self->{disk_stats}{$device} = {
-            extents_total     => 0,               # NBD transfer doesn't count extents here
-            bytes_transferred => $bytes_written,
-            bytes_dirty       => $bytes_written,
-        };
+        $self->{disk_stats}{$device} = $bytes_written;
     }
 
     return undef;
@@ -338,6 +326,7 @@ sub archive_get_firewall_config {
 
 sub _assert_mounted {
     my ($path) = @_;
+    # $path originates from trusted storage config (scfg->{path}), not user input.
     my $out = `findmnt --target "$path" 2>/dev/null`;
     die "DpxPlugin: path '$path' is not a mountpoint (NFS not mounted?)"
         unless defined $out && $out =~ /\S/;
@@ -359,6 +348,8 @@ sub _reconcile_inventory {
         my $expected = $disk->{size_bytes} // $disk->{sizeBytes};
         die "DpxPlugin: manifest disk missing device name"
             unless defined $device;
+        die "DpxPlugin: manifest disk '$device' missing size"
+            unless defined $expected;
         die "DpxPlugin: manifest disk '$device' missing on disk"
             unless exists $fs_sizes->{$device};
         my $actual = $fs_sizes->{$device};
@@ -367,24 +358,6 @@ sub _reconcile_inventory {
         $inv{$device} = { size => $actual + 0 };
     }
     return \%inv;
-}
-
-sub _parse_vmid_from_volname {
-    my ($volname) = @_;
-    # Strip optional storage prefix, leading backup/ dir, and archive extension.
-    my $bare = $volname;
-    $bare =~ s{^[^:]+:}{};
-    $bare =~ s{^backup/}{};
-    $bare =~ s{\.vma(?:\..+)?$}{};
-    # snap-<snapshotId>-vm-<vmid>
-    if ($bare =~ /-vm-(\d+)$/) {
-        return $1;
-    }
-    # vzdump-qemu-<vmid>(-<timestamp>)?
-    if ($bare =~ /^vzdump-qemu-(\d+)(?:-|$)/) {
-        return $1;
-    }
-    die "DpxPlugin: cannot parse vmid from volname '$volname'";
 }
 
 1;
