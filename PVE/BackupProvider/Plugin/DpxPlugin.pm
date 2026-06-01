@@ -1,0 +1,370 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Catalogic Software, Inc.
+package PVE::BackupProvider::Plugin::DpxPlugin;
+
+use strict;
+use warnings;
+
+use base qw(PVE::BackupProvider::Plugin::Base);
+
+use File::Path qw(make_path);
+use JSON;
+
+use PVE::INotify;
+
+use DpxVstor::HttpClient;
+use DpxVstor::NbdTransfer;
+
+# -------------------------------------------------------------------------
+# Constructor
+# -------------------------------------------------------------------------
+
+sub new {
+    my ($class, $scfg, $storeid, $log_function) = @_;
+    my $endpoint = $scfg->{'dpx-endpoint'}
+        or die "dpx-endpoint not configured on storage $storeid";
+
+    return bless {
+        scfg        => $scfg,
+        storeid     => $storeid,
+        log         => $log_function,
+        http        => DpxVstor::HttpClient->new(endpoint => $endpoint),
+        node_ip     => _resolve_node_ip(),
+        job_token     => undef,
+        disk_stats    => {},   # device -> bytes_written
+    }, $class;
+}
+
+sub provider_name { return 'DPX catalog incremental'; }
+
+# -------------------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------------------
+
+sub _resolve_node_ip {
+    my $host = PVE::INotify::nodename();
+    my @addrs = gethostbyname($host);
+    die "DpxPlugin: cannot resolve IP for node '$host'" unless @addrs >= 5;
+    return join('.', unpack('C4', $addrs[4]));
+}
+
+sub _log {
+    my ($self, $level, $msg) = @_;
+    $self->{log}->($level, $msg);
+}
+
+# -------------------------------------------------------------------------
+# Backup lifecycle
+# -------------------------------------------------------------------------
+
+sub backup_get_mechanism {
+    my ($self, $vmid, $vmtype) = @_;
+    return 'nbd';
+}
+
+sub job_init {
+    my ($self, $start_time) = @_;
+    $self->_log('info', "DpxPlugin: job_init storeid=$self->{storeid}");
+    my $resp = $self->{http}->post('/proxmox/callback/job/init', {
+        storeid => $self->{storeid},
+    });
+    my $token = $resp->{jobRunToken}
+        or die "DpxPlugin: no jobRunToken in job/init response";
+    $self->{job_token} = $token;
+    $self->_log('info', "DpxPlugin: job_init token=$token");
+    return undef;
+}
+
+sub job_cleanup {
+    my ($self) = @_;
+    my $token = $self->{job_token} or return undef;
+
+    $self->_log('info', "DpxPlugin: job_cleanup token=$token");
+
+    # Build disk map for job-done callback (keyed by device name)
+    my %disks_map;
+    for my $device (sort keys %{$self->{disk_stats}}) {
+        my $bytes = $self->{disk_stats}{$device} + 0;
+        $disks_map{$device} = {
+            bytesWritten => $bytes,
+            fileSize     => $bytes,
+        };
+    }
+
+    eval {
+        $self->{http}->post('/proxmox/callback/job-done', {
+            storeid => $self->{storeid},
+            token   => $token,
+            disks   => \%disks_map,
+        });
+    };
+    $self->_log('warn', "DpxPlugin: job-done callback failed: $@") if $@;
+
+    return undef;
+}
+
+sub backup_init {
+    my ($self, $vmid, $vmtype, $start_time) = @_;
+    my $name = "vm-$vmid-" . ($start_time // time());
+    $self->_log('info', "DpxPlugin: backup_init vmid=$vmid archive=$name");
+    return { 'archive-name' => $name };
+}
+
+sub backup_cleanup {
+    my ($self, $vmid, $vmtype, $success, $info) = @_;
+    if ($success) {
+        return { stats => { 'archive-size' => 0 } };
+    }
+    return {};
+}
+
+sub backup_vm_query_incremental {
+    my ($self, $vmid, $devices) = @_;
+    # Each device gets 'use' — let PVE decide based on existing bitmaps.
+    # PVE will set bitmap-mode='reuse' if a bitmap exists, 'new' if not.
+    my %res;
+    for my $device (keys %$devices) {
+        $res{$device} = 'use';
+    }
+    return \%res;
+}
+
+sub backup_handle_log_file {
+    my ($self, $vmid, $log) = @_;
+    return undef;
+}
+
+sub backup_vm {
+    my ($self, $vmid, $guest_config, $volumes, $info) = @_;
+    my $token = $self->{job_token}
+        or die "DpxPlugin: backup_vm called without job_token (job_init not called?)";
+
+    for my $device (sort keys %$volumes) {
+        my $vol         = $volumes->{$device};
+        my $size_bytes  = $vol->{size} // 0;
+        my $socket_path = $vol->{'nbd-path'}
+            or die "DpxPlugin: no nbd-path on $device";
+        my $bitmap_mode = $vol->{'bitmap-mode'} // 'none';
+        my $bitmap_name = $vol->{'bitmap-name'} // '';
+
+        my $transfer_action;
+        if ($bitmap_mode eq 'reuse') {
+            $transfer_action = 'incremental';
+        } else {
+            $transfer_action = 'base';
+        }
+
+        $self->_log('info', sprintf(
+            "DpxPlugin: backup_vm vmid=%s device=%s size=%s bitmap-mode=%s bitmap=%s action=%s",
+            $vmid, $device, $size_bytes, $bitmap_mode, $bitmap_name, $transfer_action));
+
+        # Tell catalog this disk is starting. The per-disk manifest depends on
+        # this callback, so a failure must fail the backup (no eval swallow).
+        $self->{http}->post('/proxmox/callback/disk-start', {
+            token      => $token,
+            storeid    => $self->{storeid},
+            vmid       => $vmid + 0,
+            device     => $device,
+            bitmapMode => $bitmap_mode,
+            bitmapName => $bitmap_name,
+            sizeBytes  => $size_bytes + 0,
+        });
+
+        # Determine target path: under the NFS-mounted storage path
+        # NFSPlugin mounts at $scfg->{path}; images go in vm-<vmid>/
+        my $storage_path = $self->{scfg}{path}
+            or die "DpxPlugin: no path in scfg (NFS not mounted?)";
+        my $target_dir  = "$storage_path/vm-$vmid";
+        my $target_path = "$target_dir/$device.img";
+
+        make_path($target_dir) unless -d $target_dir;
+
+        # Perform data transfer directly via UNIX socket
+        eval {
+            DpxVstor::NbdTransfer::copy(
+                socket_path => $socket_path,
+                action      => $transfer_action,
+                target_path => $target_path,
+                bitmap_name => $bitmap_name,
+                export_name => $device,
+                size_bytes  => $size_bytes,
+                log         => $self->{log},
+            );
+        };
+        if ($@) {
+            die "DpxPlugin: NbdTransfer failed for $device: $@";
+        }
+
+        my $bytes_written = -s $target_path // 0;
+        $self->_log('info', sprintf(
+            "DpxPlugin: %s done bytes_written=%d", $device, $bytes_written));
+
+        # Accumulate stats for job_cleanup
+        $self->{disk_stats}{$device} = $bytes_written;
+    }
+
+    return undef;
+}
+
+# -------------------------------------------------------------------------
+# Restore lifecycle
+# -------------------------------------------------------------------------
+
+sub restore_get_mechanism {
+    my ($self, $volname) = @_;
+    return ('qemu-img', 'qemu');
+}
+
+sub restore_vm_init {
+    my ($self, $volname) = @_;
+    $self->_log('info', "DpxPlugin: restore_vm_init volname=$volname storeid=" . ($self->{storeid} // 'undef'));
+
+    my $resp = $self->{http}->post('/proxmox/restore/init', {
+        volname     => $volname,
+        pve_node_ip => $self->{node_ip},
+        storeid     => $self->{storeid},
+    });
+
+    die "DpxPlugin: /proxmox/restore/init did not return a JSON object"
+        unless ref($resp) eq 'HASH';
+
+    my $session_id = $resp->{session_id}
+        or die "DpxPlugin: no session_id in /proxmox/restore/init response";
+    die "DpxPlugin: no vmid in /proxmox/restore/init response"
+        unless defined $resp->{vmid};
+    die "DpxPlugin: no disks array in /proxmox/restore/init response"
+        unless ref($resp->{disks}) eq 'ARRAY';
+
+    my $source_vmid = $resp->{vmid};   # AUTHORITATIVE: from recovery point
+
+    $self->{restore_session_id}   = $session_id;
+    $self->{restore_volname}      = $volname;
+    $self->{restore_guest_config} = $resp->{vm_config};
+    $self->{restore_source_vmid}  = $source_vmid;
+    $self->_log('info', "DpxPlugin: vm_config received? " . (defined $resp->{vm_config} ? "yes (" . length($resp->{vm_config}) . " bytes)" : "no"));
+    $self->_log('info', "DpxPlugin: restore session_id=$session_id vmid=$source_vmid");
+
+    # The storage is NFS-backed via NFSPlugin; images live at $scfg->{path}/vm-<vmid>/
+    my $storage_path = $self->{scfg}{path}
+        or die "DpxPlugin: no path in scfg (NFS not mounted?)";
+    _assert_mounted($storage_path);
+    my $vm_dir = "$storage_path/vm-$source_vmid";
+
+    # Collect on-disk *.img sizes, then strictly reconcile against the manifest.
+    my %fs_sizes;
+    if (-d $vm_dir) {
+        opendir(my $dh, $vm_dir) or die "cannot opendir $vm_dir: $!";
+        while (my $entry = readdir($dh)) {
+            next unless $entry =~ /^(.+)\.img$/;
+            my $device = $1;
+            my @st = stat("$vm_dir/$entry") or next;
+            $fs_sizes{$device} = $st[7] + 0;
+        }
+        closedir $dh;
+    }
+
+    my $inv = _reconcile_inventory($resp->{disks}, \%fs_sizes);
+
+    $self->_log('info', sprintf("DpxPlugin: restore inventory: %d disks", scalar keys %$inv));
+    return $inv;
+}
+
+sub restore_vm_volume_init {
+    my ($self, $volname, $device_name, $info) = @_;
+    die "DpxPlugin: no restore session for $volname" unless $self->{restore_session_id};
+
+    my $vmid      = $self->{restore_source_vmid};
+    my $storage_path = $self->{scfg}{path}
+        or die "DpxPlugin: no path in scfg";
+    my $img_path  = "$storage_path/vm-$vmid/$device_name.img";
+
+    die "DpxPlugin: image not found at $img_path" unless -f $img_path;
+
+    $self->_log('info', "DpxPlugin: restore_vm_volume_init device=$device_name path=$img_path");
+    return { 'qemu-img-path' => $img_path };
+}
+
+sub restore_vm_volume_cleanup {
+    my ($self, $volname, $device_name, $info) = @_;
+    return undef;
+}
+
+sub restore_vm_cleanup {
+    my ($self, $volname) = @_;
+    my $session_id = $self->{restore_session_id} or return undef;
+
+    $self->_log('info', "DpxPlugin: restore_vm_cleanup session_id=$session_id");
+
+    eval {
+        $self->{http}->post('/proxmox/restore/cleanup', {
+            session_id => $session_id,
+        });
+    };
+    $self->_log('warn', "DpxPlugin: restore cleanup failed: $@") if $@;
+
+    delete $self->{restore_session_id};
+    delete $self->{restore_volname};
+    delete $self->{restore_source_vmid};
+    return undef;
+}
+
+sub archive_get_guest_config {
+    my ($self, $volname) = @_;
+    # Guest config is delivered via the /proxmox/restore/init callback response
+    # and cached on $self by restore_vm_init.
+    return $self->{restore_guest_config};
+}
+
+sub archive_get_firewall_config {
+    my ($self, $volname) = @_;
+    return undef;
+}
+
+# -------------------------------------------------------------------------
+# Internal helpers
+# -------------------------------------------------------------------------
+
+sub _assert_mounted {
+    my ($path) = @_;
+    # $path originates from trusted storage config (scfg->{path}), not user input.
+    my $out = `findmnt --target "$path" 2>/dev/null`;
+    die "DpxPlugin: path '$path' is not a mountpoint (NFS not mounted?)"
+        unless defined $out && $out =~ /\S/;
+    return 1;
+}
+
+# Pure helper: strictly reconcile manifest disks (from the catalog recovery
+# point) against the *.img sizes found on disk.
+#   $manifest_disks: arrayref of { device => ..., image_name => ..., size_bytes => ... }
+#                    (also accepts sizeBytes defensively)
+#   $fs_sizes:       hashref on-disk-image-name => actual_size_on_disk
+# Returns inventory hashref { image_name => { size => actual } } or dies.
+# Foreign *.img files present on disk but absent from the manifest are ignored.
+sub _reconcile_inventory {
+    my ($manifest_disks, $fs_sizes) = @_;
+    my %inv;
+    for my $disk (@{$manifest_disks // []}) {
+        my $device = $disk->{device};
+        my $expected = $disk->{size_bytes} // $disk->{sizeBytes};
+        die "DpxPlugin: manifest disk missing device name"
+            unless defined $device;
+        die "DpxPlugin: manifest disk '$device' missing size"
+            unless defined $expected;
+        # image_name is the AUTHORITATIVE on-disk image device key from the
+        # recovery point (e.g. 'drive-virtio0'); the file is vm-<vmid>/<key>.img.
+        # Older recovery points lack it: fall back to the logical device slot.
+        my $key = (defined $disk->{image_name} && length $disk->{image_name})
+            ? $disk->{image_name}
+            : $device;
+        die "DpxPlugin: manifest disk '$device' (image '$key') missing on disk"
+            unless exists $fs_sizes->{$key};
+        my $actual = $fs_sizes->{$key};
+        die "DpxPlugin: size mismatch for '$device' (manifest=$expected on-disk=$actual)"
+            unless $actual == $expected;
+        # Key by the ON-DISK image name so restore_vm_volume_init resolves the real file.
+        $inv{$key} = { size => $actual + 0 };
+    }
+    return \%inv;
+}
+
+1;
