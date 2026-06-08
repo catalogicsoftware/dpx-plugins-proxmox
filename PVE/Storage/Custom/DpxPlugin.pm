@@ -1,5 +1,13 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Catalogic Software, Inc.
+#
+# As an additional permission under section 7 of the GNU Affero General
+# Public License version 3, Catalogic Software, Inc. grants permission to
+# link this Program with the proprietary modules DpxVstor::HttpClient and
+# DpxVstor::NbdTransfer (the "DpxVstor Modules") and to convey the
+# resulting combined work, provided that the portions of the combined work
+# that are covered by the AGPL remain licensed under AGPL-3.0-or-later.
+# This additional permission applies only to the DpxVstor Modules.
 package PVE::Storage::Custom::DpxPlugin;
 
 use strict;
@@ -31,6 +39,11 @@ sub properties {
             description => 'DPX catalog HTTP endpoint (e.g. http://dpx-catalog.example.com:8080)',
             type        => 'string',
         },
+        'dpx-node-ip' => {
+            description => 'The IP this PVE node advertises to the DPX catalog for the restore data path',
+            type        => 'string',
+            optional    => 1,
+        },
     };
 }
 
@@ -39,6 +52,7 @@ sub options {
     return {
         %$parent_opts,
         'dpx-endpoint' => { fixed => 1 },
+        'dpx-node-ip'  => { optional => 1 },
     };
 }
 

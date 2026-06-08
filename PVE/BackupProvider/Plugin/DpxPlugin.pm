@@ -1,5 +1,13 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Catalogic Software, Inc.
+#
+# As an additional permission under section 7 of the GNU Affero General
+# Public License version 3, Catalogic Software, Inc. grants permission to
+# link this Program with the proprietary modules DpxVstor::HttpClient and
+# DpxVstor::NbdTransfer (the "DpxVstor Modules") and to convey the
+# resulting combined work, provided that the portions of the combined work
+# that are covered by the AGPL remain licensed under AGPL-3.0-or-later.
+# This additional permission applies only to the DpxVstor Modules.
 package PVE::BackupProvider::Plugin::DpxPlugin;
 
 use strict;
@@ -20,12 +28,16 @@ sub new {
     my $endpoint = $scfg->{'dpx-endpoint'}
         or die "dpx-endpoint not configured on storage $storeid";
 
+    my $node_ip = (defined $scfg->{'dpx-node-ip'} && length $scfg->{'dpx-node-ip'})
+        ? $scfg->{'dpx-node-ip'}
+        : _resolve_node_ip();
+
     return bless {
         scfg        => $scfg,
         storeid     => $storeid,
         log         => $log_function,
         http        => DpxVstor::HttpClient->new(endpoint => $endpoint),
-        node_ip     => _resolve_node_ip(),
+        node_ip     => $node_ip,
         job_token     => undef,
         disk_stats    => {},   # device -> bytes_written
     }, $class;
@@ -103,6 +115,16 @@ sub backup_cleanup {
     if ($success) {
         return { stats => { 'archive-size' => 0 } };
     }
+    # Backup failed. We have no failure callback to the catalog, but the
+    # catalog's job-done await will time out and discard the run, so no
+    # recovery point is created. Surface the failure loudly here instead of
+    # returning silently — a no-op return makes a failed backup invisible in
+    # the PVE task log. The scratch image at vm-$vmid/<device>.img is left
+    # in place; it is overwritten (truncated) by the next run before use.
+    $self->_log('warn', sprintf(
+        "DpxPlugin: backup FAILED for vmid=%s (token=%s) — no job-done sent; "
+        . "catalog will discard this run on timeout",
+        $vmid, ($self->{job_token} // 'none')));
     return {};
 }
 
@@ -222,10 +244,11 @@ sub restore_vm_init {
 
     my $source_vmid = $resp->{vmid};   # AUTHORITATIVE: from recovery point
 
-    $self->{restore_session_id}   = $session_id;
-    $self->{restore_volname}      = $volname;
-    $self->{restore_guest_config} = $resp->{vm_config};
-    $self->{restore_source_vmid}  = $source_vmid;
+    $self->{restore}{$volname} = {
+        session_id   => $session_id,
+        source_vmid  => $source_vmid,
+        guest_config => $resp->{vm_config},
+    };
     $self->_log('info', "DpxPlugin: vm_config received? " . (defined $resp->{vm_config} ? "yes (" . length($resp->{vm_config}) . " bytes)" : "no"));
     $self->_log('info', "DpxPlugin: restore session_id=$session_id vmid=$source_vmid");
 
@@ -256,9 +279,10 @@ sub restore_vm_init {
 
 sub restore_vm_volume_init {
     my ($self, $volname, $device_name, $info) = @_;
-    die "DpxPlugin: no restore session for $volname" unless $self->{restore_session_id};
+    my $restore = $self->{restore}{$volname};
+    die "DpxPlugin: no restore session for $volname" unless $restore;
 
-    my $vmid      = $self->{restore_source_vmid};
+    my $vmid      = $restore->{source_vmid};
     my $storage_path = $self->{scfg}{path}
         or die "DpxPlugin: no path in scfg";
     my $img_path  = "$storage_path/vm-$vmid/$device_name.img";
@@ -276,7 +300,8 @@ sub restore_vm_volume_cleanup {
 
 sub restore_vm_cleanup {
     my ($self, $volname) = @_;
-    my $session_id = $self->{restore_session_id} or return undef;
+    my $restore = $self->{restore}{$volname} or return undef;
+    my $session_id = $restore->{session_id} or return undef;
 
     $self->_log('info', "DpxPlugin: restore_vm_cleanup session_id=$session_id");
 
@@ -287,17 +312,16 @@ sub restore_vm_cleanup {
     };
     $self->_log('warn', "DpxPlugin: restore cleanup failed: $@") if $@;
 
-    delete $self->{restore_session_id};
-    delete $self->{restore_volname};
-    delete $self->{restore_source_vmid};
+    delete $self->{restore}{$volname};
     return undef;
 }
 
 sub archive_get_guest_config {
     my ($self, $volname) = @_;
     # Guest config is delivered via the /proxmox/restore/init callback response
-    # and cached on $self by restore_vm_init.
-    return $self->{restore_guest_config};
+    # and cached per-volname by restore_vm_init.
+    my $restore = $self->{restore}{$volname} or return undef;
+    return $restore->{guest_config};
 }
 
 sub archive_get_firewall_config {
