@@ -1,13 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Catalogic Software, Inc.
-#
-# As an additional permission under section 7 of the GNU Affero General
-# Public License version 3, Catalogic Software, Inc. grants permission to
-# link this Program with the proprietary modules DpxVstor::HttpClient and
-# DpxVstor::NbdTransfer (the "DpxVstor Modules") and to convey the
-# resulting combined work, provided that the portions of the combined work
-# that are covered by the AGPL remain licensed under AGPL-3.0-or-later.
-# This additional permission applies only to the DpxVstor Modules.
 package PVE::BackupProvider::Plugin::DpxPlugin;
 
 use strict;
