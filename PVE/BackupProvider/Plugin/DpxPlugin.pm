@@ -234,7 +234,11 @@ sub restore_vm_init {
     die "DpxPlugin: no disks array in /proxmox/restore/init response"
         unless ref($resp->{disks}) eq 'ARRAY';
 
-    my $source_vmid = $resp->{vmid};   # AUTHORITATIVE: from recovery point
+    # Untaint at the boundary: $resp comes from decode_json over a socket, so
+    # under -T it is tainted and would poison the qemu-img-path PVE feeds to
+    # `qemu-img info`. A vmid is a positive integer.
+    my ($source_vmid) = (($resp->{vmid} // '') =~ /^(\d+)$/)
+        or die "DpxPlugin: invalid vmid in /proxmox/restore/init response: " . ($resp->{vmid} // 'undef');
 
     $self->{restore}{$volname} = {
         session_id   => $session_id,
@@ -279,7 +283,14 @@ sub restore_vm_volume_init {
     my $vmid      = $restore->{source_vmid};
     my $storage_path = $self->{scfg}{path}
         or die "DpxPlugin: no path in scfg";
-    my $img_path  = "$storage_path/vm-$vmid/$device_name.img";
+    # $device_name is the inventory key returned by restore_vm_init, which
+    # derives from $resp->{disks} (image_name/device) over the socket and is
+    # therefore tainted. It becomes a single filename component in $img_path
+    # (the qemu-img-path), so untaint it: an image device key is word chars,
+    # dots and hyphens only (e.g. 'drive-virtio0'), no path separators.
+    my ($safe_device) = ($device_name =~ /^([\w.\-]+)$/)
+        or die "DpxPlugin: invalid device name '$device_name'";
+    my $img_path  = "$storage_path/vm-$vmid/$safe_device.img";
 
     die "DpxPlugin: image not found at $img_path" unless -f $img_path;
 
