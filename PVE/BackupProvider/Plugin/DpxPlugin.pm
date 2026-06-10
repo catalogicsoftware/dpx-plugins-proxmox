@@ -31,7 +31,7 @@ sub new {
         http        => DpxVstor::HttpClient->new(endpoint => $endpoint),
         node_ip     => $node_ip,
         job_token     => undef,
-        disk_stats    => {},   # device -> bytes_written
+        disk_stats    => {},
     }, $class;
 }
 
@@ -73,7 +73,6 @@ sub job_cleanup {
 
     $self->_log('info', "DpxPlugin: job_cleanup token=$token");
 
-    # Build disk map for job-done callback (keyed by device name)
     my %disks_map;
     for my $device (sort keys %{$self->{disk_stats}}) {
         my $bytes = $self->{disk_stats}{$device} + 0;
@@ -107,12 +106,6 @@ sub backup_cleanup {
     if ($success) {
         return { stats => { 'archive-size' => 0 } };
     }
-    # Backup failed. We have no failure callback to the catalog, but the
-    # catalog's job-done await will time out and discard the run, so no
-    # recovery point is created. Surface the failure loudly here instead of
-    # returning silently — a no-op return makes a failed backup invisible in
-    # the PVE task log. The scratch image at vm-$vmid/<device>.img is left
-    # in place; it is overwritten (truncated) by the next run before use.
     $self->_log('warn', sprintf(
         "DpxPlugin: backup FAILED for vmid=%s (token=%s) — no job-done sent; "
         . "catalog will discard this run on timeout",
@@ -122,8 +115,6 @@ sub backup_cleanup {
 
 sub backup_vm_query_incremental {
     my ($self, $vmid, $devices) = @_;
-    # Each device gets 'use' — let PVE decide based on existing bitmaps.
-    # PVE will set bitmap-mode='reuse' if a bitmap exists, 'new' if not.
     my %res;
     for my $device (keys %$devices) {
         $res{$device} = 'use';
@@ -160,8 +151,6 @@ sub backup_vm {
             "DpxPlugin: backup_vm vmid=%s device=%s size=%s bitmap-mode=%s bitmap=%s action=%s",
             $vmid, $device, $size_bytes, $bitmap_mode, $bitmap_name, $transfer_action));
 
-        # Tell catalog this disk is starting. The per-disk manifest depends on
-        # this callback, so a failure must fail the backup (no eval swallow).
         $self->{http}->post('/proxmox/callback/disk-start', {
             token      => $token,
             storeid    => $self->{storeid},
@@ -172,8 +161,6 @@ sub backup_vm {
             sizeBytes  => $size_bytes + 0,
         });
 
-        # Determine target path: under the NFS-mounted storage path
-        # NFSPlugin mounts at $scfg->{path}; images go in vm-<vmid>/
         my $storage_path = $self->{scfg}{path}
             or die "DpxPlugin: no path in scfg (NFS not mounted?)";
         my $target_dir  = "$storage_path/vm-$vmid";
@@ -181,7 +168,6 @@ sub backup_vm {
 
         make_path($target_dir) unless -d $target_dir;
 
-        # Perform data transfer directly via UNIX socket
         my $bytes_written;
         eval {
             $bytes_written = DpxVstor::NbdTransfer::copy(
@@ -202,7 +188,6 @@ sub backup_vm {
         $self->_log('info', sprintf(
             "DpxPlugin: %s done bytes_written=%d", $device, $bytes_written));
 
-        # Accumulate stats for job_cleanup
         $self->{disk_stats}{$device} = $bytes_written;
     }
 
@@ -234,9 +219,6 @@ sub restore_vm_init {
     die "DpxPlugin: no disks array in /proxmox/restore/init response"
         unless ref($resp->{disks}) eq 'ARRAY';
 
-    # Untaint at the boundary: $resp comes from decode_json over a socket, so
-    # under -T it is tainted and would poison the qemu-img-path PVE feeds to
-    # `qemu-img info`. A vmid is a positive integer.
     my ($source_vmid) = (($resp->{vmid} // '') =~ /^(\d+)$/)
         or die "DpxPlugin: invalid vmid in /proxmox/restore/init response: " . ($resp->{vmid} // 'undef');
 
@@ -248,13 +230,11 @@ sub restore_vm_init {
     $self->_log('info', "DpxPlugin: vm_config received? " . (defined $resp->{vm_config} ? "yes (" . length($resp->{vm_config}) . " bytes)" : "no"));
     $self->_log('info', "DpxPlugin: restore session_id=$session_id vmid=$source_vmid");
 
-    # The storage is NFS-backed via NFSPlugin; images live at $scfg->{path}/vm-<vmid>/
     my $storage_path = $self->{scfg}{path}
         or die "DpxPlugin: no path in scfg (NFS not mounted?)";
     _assert_mounted($storage_path);
     my $vm_dir = "$storage_path/vm-$source_vmid";
 
-    # Collect on-disk *.img sizes, then strictly reconcile against the manifest.
     my %fs_sizes;
     if (-d $vm_dir) {
         opendir(my $dh, $vm_dir) or die "cannot opendir $vm_dir: $!";
@@ -283,11 +263,6 @@ sub restore_vm_volume_init {
     my $vmid      = $restore->{source_vmid};
     my $storage_path = $self->{scfg}{path}
         or die "DpxPlugin: no path in scfg";
-    # $device_name is the inventory key returned by restore_vm_init, which
-    # derives from $resp->{disks} (image_name/device) over the socket and is
-    # therefore tainted. It becomes a single filename component in $img_path
-    # (the qemu-img-path), so untaint it: an image device key is word chars,
-    # dots and hyphens only (e.g. 'drive-virtio0'), no path separators.
     my ($safe_device) = ($device_name =~ /^([\w.\-]+)$/)
         or die "DpxPlugin: invalid device name '$device_name'";
     my $img_path  = "$storage_path/vm-$vmid/$safe_device.img";
@@ -323,8 +298,6 @@ sub restore_vm_cleanup {
 
 sub archive_get_guest_config {
     my ($self, $volname) = @_;
-    # Guest config is delivered via the /proxmox/restore/init callback response
-    # and cached per-volname by restore_vm_init.
     my $restore = $self->{restore}{$volname} or return undef;
     return $restore->{guest_config};
 }
@@ -336,20 +309,12 @@ sub archive_get_firewall_config {
 
 sub _assert_mounted {
     my ($path) = @_;
-    # $path originates from trusted storage config (scfg->{path}), not user input.
     my $out = `findmnt --target "$path" 2>/dev/null`;
     die "DpxPlugin: path '$path' is not a mountpoint (NFS not mounted?)"
         unless defined $out && $out =~ /\S/;
     return 1;
 }
 
-# Pure helper: strictly reconcile manifest disks (from the catalog recovery
-# point) against the *.img sizes found on disk.
-#   $manifest_disks: arrayref of { device => ..., image_name => ..., size_bytes => ... }
-#                    (also accepts sizeBytes defensively)
-#   $fs_sizes:       hashref on-disk-image-name => actual_size_on_disk
-# Returns inventory hashref { image_name => { size => actual } } or dies.
-# Foreign *.img files present on disk but absent from the manifest are ignored.
 sub _reconcile_inventory {
     my ($manifest_disks, $fs_sizes) = @_;
     my %inv;
@@ -360,9 +325,6 @@ sub _reconcile_inventory {
             unless defined $device;
         die "DpxPlugin: manifest disk '$device' missing size"
             unless defined $expected;
-        # image_name is the AUTHORITATIVE on-disk image device key from the
-        # recovery point (e.g. 'drive-virtio0'); the file is vm-<vmid>/<key>.img.
-        # Older recovery points lack it: fall back to the logical device slot.
         my $key = (defined $disk->{image_name} && length $disk->{image_name})
             ? $disk->{image_name}
             : $device;
@@ -371,7 +333,6 @@ sub _reconcile_inventory {
         my $actual = $fs_sizes->{$key};
         die "DpxPlugin: size mismatch for '$device' (manifest=$expected on-disk=$actual)"
             unless $actual == $expected;
-        # Key by the ON-DISK image name so restore_vm_volume_init resolves the real file.
         $inv{$key} = { size => $actual + 0 };
     }
     return \%inv;

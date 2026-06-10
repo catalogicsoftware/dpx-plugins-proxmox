@@ -11,9 +11,6 @@ sub api { return 11; }
 sub type { return 'dpx-vstor'; }
 
 sub plugindata {
-    # PVE convention: content => [allowed-types, default-type]. Both
-    # entries are { backup => 1 } because this plugin only handles
-    # backups (the default and the only allowed type are the same).
     return {
         content  => [{ backup => 1 }, { backup => 1 }],
         features => { 'backup-provider' => 1 },
