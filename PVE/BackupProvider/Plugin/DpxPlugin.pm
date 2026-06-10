@@ -258,7 +258,9 @@ sub restore_vm_init {
             next unless $entry =~ /^(.+)\.img$/;
             my $device = $1;
             my @st = stat("$vm_dir/$entry") or next;
-            $fs_sizes{$device} = $st[7] + 0;
+            my ($sz) = ($st[7] =~ /^(\d+)$/)
+                or die "DpxPlugin: bad size for $entry";
+            $fs_sizes{$device} = $sz;
         }
         closedir $dh;
     }
