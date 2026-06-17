@@ -18,32 +18,27 @@ use DpxVstor::PluginVersion;
 use DpxVstor::IntegrityGate;
 use DpxVstor::GenIdSidecar;
 
-# -------------------------------------------------------------------------
-# Constructor
-# -------------------------------------------------------------------------
-
 sub new {
     my ($class, $scfg, $storeid, $log_function) = @_;
     my $endpoint = $scfg->{'dpx-endpoint'}
         or die "dpx-endpoint not configured on storage $storeid";
+
+    my $node_ip = (defined $scfg->{'dpx-node-ip'} && length $scfg->{'dpx-node-ip'})
+        ? $scfg->{'dpx-node-ip'}
+        : _resolve_node_ip();
 
     return bless {
         scfg        => $scfg,
         storeid     => $storeid,
         log         => $log_function,
         http        => DpxVstor::HttpClient->new(endpoint => $endpoint),
-        node_ip     => _resolve_node_ip(),
+        node_ip     => $node_ip,
         job_token     => undef,
-        disk_stats    => {},   # device -> {extents_total, bytes_transferred, bytes_dirty}
-        archive_names => {},   # vmid -> archive name
+        disk_stats    => {},
     }, $class;
 }
 
 sub provider_name { return 'DPX catalog incremental'; }
-
-# -------------------------------------------------------------------------
-# Helpers
-# -------------------------------------------------------------------------
 
 sub _resolve_node_ip {
     my $host = PVE::INotify::nodename();
@@ -56,10 +51,6 @@ sub _log {
     my ($self, $level, $msg) = @_;
     $self->{log}->($level, $msg);
 }
-
-# -------------------------------------------------------------------------
-# Backup lifecycle
-# -------------------------------------------------------------------------
 
 sub backup_get_mechanism {
     my ($self, $vmid, $vmtype) = @_;
@@ -86,13 +77,12 @@ sub job_cleanup {
 
     $self->_log('info', "DpxPlugin: job_cleanup token=$token");
 
-    # Build disk map for job-done callback (keyed by device name)
     my %disks_map;
     for my $device (sort keys %{$self->{disk_stats}}) {
-        my $s = $self->{disk_stats}{$device};
+        my $bytes = $self->{disk_stats}{$device} + 0;
         $disks_map{$device} = {
-            bytesWritten => $s->{bytes_transferred} + 0,
-            fileSize     => $s->{bytes_transferred} + 0,
+            bytesWritten => $bytes,
+            fileSize     => $bytes,
         };
     }
 
@@ -111,7 +101,6 @@ sub job_cleanup {
 sub backup_init {
     my ($self, $vmid, $vmtype, $start_time) = @_;
     my $name = "vm-$vmid-" . ($start_time // time());
-    $self->{archive_names}->{$vmid} = $name;
     $self->_log('info', "DpxPlugin: backup_init vmid=$vmid archive=$name");
     return { 'archive-name' => $name };
 }
@@ -121,19 +110,16 @@ sub backup_cleanup {
     if ($success) {
         return { stats => { 'archive-size' => 0 } };
     }
+    $self->_log('warn', sprintf(
+        "DpxPlugin: backup FAILED for vmid=%s (token=%s) — no job-done sent; "
+        . "catalog will discard this run on timeout",
+        $vmid, ($self->{job_token} // 'none')));
     return {};
 }
 
 sub backup_vm_query_incremental {
     my ($self, $vmid, $devices) = @_;
 
-    # Ask the catalog which disks must run full. The catalog folds in the
-    # version-gate, the durable force-full/remediation flag, AND baseline-genId
-    # divergence. Returning PVE 'new' here makes QEMU create a FRESH bitmap and
-    # stream a full for that disk — the force-full and the bitmap reset happen
-    # together, so the next run starts a clean incremental chain. 'use' lets PVE
-    # reuse the existing bitmap (incremental). On any failure we fail safe to
-    # 'new' (full) rather than risk overlaying onto a diverged base.
     my $storage_path = $self->{scfg}{path};
 
     my $read_genid = sub {
@@ -231,8 +217,6 @@ sub backup_vm {
             "DpxPlugin: backup_vm vmid=%s device=%s size=%s bitmap-mode=%s bitmap=%s action=%s",
             $vmid, $device, $size_bytes, $bitmap_mode, $bitmap_name, $transfer_action));
 
-        # Determine target path: under the NFS-mounted storage path
-        # NFSPlugin mounts at $scfg->{path}; images go in vm-<vmid>/
         my $storage_path = $self->{scfg}{path}
             or die "DpxPlugin: no path in scfg (NFS not mounted?)";
         my $target_dir  = "$storage_path/vm-$vmid";
@@ -244,15 +228,6 @@ sub backup_vm {
             $storage_path, $vmid, $device);
         my $baseline_genid = DpxVstor::GenIdSidecar::read_genid($genid_path);
 
-        # Tell catalog this disk is starting; the response carries a genId
-        # (a fresh UUID on a base run, the echoed baseline on an incremental)
-        # and an action ('base'/'incremental'). action='base' is the catalog's
-        # force-full verdict (version-gate / force-full flag / genId divergence).
-        # Path A normally resets the bitmap at query_incremental so PVE already
-        # hands us bitmap_mode!='reuse' here; this is the data-path backstop for
-        # the case where the 'new' verdict did not reach QEMU. We override to a
-        # full rebuild but DO NOT touch the QEMU bitmap (that was handled at
-        # query_incremental) — we only refuse to overlay onto a diverged base.
         my $disk_start_action;
         eval {
             my $resp = $self->{http}->post('/proxmox/callback/disk-start', {
@@ -285,17 +260,10 @@ sub backup_vm {
             $transfer_action = 'base';
         }
 
-        # Capture the pre-overlay allocation of the existing target image for a
-        # reuse/overlay incremental. This becomes the integrity-gate floor:
-        # a legitimate incremental keeps at least (pre_overlay - punched_zero)
-        # allocated, so a collapsed-shell overlay (correct logical size but
-        # near-zero allocation) is detected. For a base run there is nothing to
-        # collapse from, so the floor stays 0.
         my $pre_overlay_alloc = ($effective_bitmap_mode eq 'reuse' && -e $target_path)
             ? DpxVstor::IntegrityGate::allocated_bytes($target_path)
             : 0;
 
-        # Perform data transfer directly via UNIX socket
         my $bytes_written = 0;
         my $transfer_summary = {};
         eval {
@@ -310,18 +278,12 @@ sub backup_vm {
                 log         => $self->{log},
             );
             $transfer_summary = {} unless ref($transfer_summary) eq 'HASH';
-            # Get written size from file
             $bytes_written = -s $target_path // 0;
         };
         if ($@) {
             die "DpxPlugin: NbdTransfer failed for $device: $@";
         }
 
-        # Post-fsync integrity gate: verify the just-written live image and
-        # report the result so the catalog can refuse the snapshot if it fails.
-        # For a reuse/overlay incremental we pass the pre-overlay allocation as
-        # the floor so a collapsed-shell write (correct logical size, near-zero
-        # allocation) is caught. For a base run the floor is 0.
         my $punched_zero_bytes = $transfer_summary->{punched_zero_bytes} // 0;
         my $integ = DpxVstor::IntegrityGate::check(
             target_path          => $target_path,
@@ -343,12 +305,6 @@ sub backup_vm {
                 message          => $integ->{message} // '',
             });
         };
-        # If this POST is swallowed (transient HTTP failure / crash), the
-        # catalog receives no integrity result for this disk and FAILS CLOSED
-        # (ProxmoxBackupRunner.runVm requires a passed result for every
-        # transferred disk). We therefore do not die here on a POST failure;
-        # we only warn so the missing-result path stays the single source of
-        # truth for correctness.
         $self->_log('warn',
             "DpxPlugin: integrity-result POST failed for $device (catalog will "
           . "fail closed on the missing result): $@") if $@;
@@ -360,20 +316,11 @@ sub backup_vm {
             "DpxPlugin: %s done bytes_written=%d file_size=%d",
             $device, $bytes_written, $file_size));
 
-        # Accumulate stats for job_cleanup
-        $self->{disk_stats}{$device} = {
-            extents_total     => 0,               # NBD transfer doesn't count extents here
-            bytes_transferred => $bytes_written,
-            bytes_dirty       => $bytes_written,
-        };
+        $self->{disk_stats}{$device} = $bytes_written;
     }
 
     return undef;
 }
-
-# -------------------------------------------------------------------------
-# Restore lifecycle
-# -------------------------------------------------------------------------
 
 sub restore_get_mechanism {
     my ($self, $volname) = @_;
@@ -382,56 +329,71 @@ sub restore_get_mechanism {
 
 sub restore_vm_init {
     my ($self, $volname) = @_;
-    $self->_log('info', "DpxPlugin: restore_vm_init volname=$volname");
+    $self->_log('info', "DpxPlugin: restore_vm_init volname=$volname storeid=" . ($self->{storeid} // 'undef'));
 
     my $resp = $self->{http}->post('/proxmox/restore/init', {
         volname     => $volname,
         pve_node_ip => $self->{node_ip},
+        storeid     => $self->{storeid},
     });
+
+    die "DpxPlugin: /proxmox/restore/init did not return a JSON object"
+        unless ref($resp) eq 'HASH';
 
     my $session_id = $resp->{session_id}
         or die "DpxPlugin: no session_id in /proxmox/restore/init response";
+    die "DpxPlugin: no vmid in /proxmox/restore/init response"
+        unless defined $resp->{vmid};
+    die "DpxPlugin: no disks array in /proxmox/restore/init response"
+        unless ref($resp->{disks}) eq 'ARRAY';
 
-    $self->{restore_session_id} = $session_id;
-    $self->{restore_volname}    = $volname;
+    my ($source_vmid) = (($resp->{vmid} // '') =~ /^(\d+)$/)
+        or die "DpxPlugin: invalid vmid in /proxmox/restore/init response: " . ($resp->{vmid} // 'undef');
 
-    # The vmid is encoded in the volname: e.g. snap-<id>-vm-<vmid>.vma
-    my $source_vmid = _parse_vmid_from_volname($volname);
-    $self->{restore_source_vmid} = $source_vmid;
-
+    $self->{restore}{$volname} = {
+        session_id   => $session_id,
+        source_vmid  => $source_vmid,
+        guest_config => $resp->{vm_config},
+    };
+    $self->_log('info', "DpxPlugin: vm_config received? " . (defined $resp->{vm_config} ? "yes (" . length($resp->{vm_config}) . " bytes)" : "no"));
     $self->_log('info', "DpxPlugin: restore session_id=$session_id vmid=$source_vmid");
 
-    # Discover disk inventory from the NFS-mounted path
-    # The storage is NFS-backed via NFSPlugin; images live at $scfg->{path}/vm-<vmid>/
     my $storage_path = $self->{scfg}{path}
         or die "DpxPlugin: no path in scfg (NFS not mounted?)";
+    _assert_mounted($storage_path);
     my $vm_dir = "$storage_path/vm-$source_vmid";
 
-    my %inv;
+    my %fs_sizes;
     if (-d $vm_dir) {
         opendir(my $dh, $vm_dir) or die "cannot opendir $vm_dir: $!";
         while (my $entry = readdir($dh)) {
             next unless $entry =~ /^(.+)\.img$/;
             my $device = $1;
-            my $path   = "$vm_dir/$entry";
-            my @st = stat($path) or next;
-            $inv{$device} = { size => $st[7] + 0 };
+            my @st = stat("$vm_dir/$entry") or next;
+            my ($sz) = ($st[7] =~ /^(\d+)$/)
+                or die "DpxPlugin: bad size for $entry";
+            $fs_sizes{$device} = $sz;
         }
         closedir $dh;
     }
 
-    $self->_log('info', sprintf("DpxPlugin: restore inventory: %d disks", scalar keys %inv));
-    return \%inv;
+    my $inv = _reconcile_inventory($resp->{disks}, \%fs_sizes);
+
+    $self->_log('info', sprintf("DpxPlugin: restore inventory: %d disks", scalar keys %$inv));
+    return $inv;
 }
 
 sub restore_vm_volume_init {
     my ($self, $volname, $device_name, $info) = @_;
-    die "DpxPlugin: no restore session for $volname" unless $self->{restore_session_id};
+    my $restore = $self->{restore}{$volname};
+    die "DpxPlugin: no restore session for $volname" unless $restore;
 
-    my $vmid      = $self->{restore_source_vmid};
+    my $vmid      = $restore->{source_vmid};
     my $storage_path = $self->{scfg}{path}
         or die "DpxPlugin: no path in scfg";
-    my $img_path  = "$storage_path/vm-$vmid/$device_name.img";
+    my ($safe_device) = ($device_name =~ /^([\w.\-]+)$/)
+        or die "DpxPlugin: invalid device name '$device_name'";
+    my $img_path  = "$storage_path/vm-$vmid/$safe_device.img";
 
     die "DpxPlugin: image not found at $img_path" unless -f $img_path;
 
@@ -446,7 +408,8 @@ sub restore_vm_volume_cleanup {
 
 sub restore_vm_cleanup {
     my ($self, $volname) = @_;
-    my $session_id = $self->{restore_session_id} or return undef;
+    my $restore = $self->{restore}{$volname} or return undef;
+    my $session_id = $restore->{session_id} or return undef;
 
     $self->_log('info', "DpxPlugin: restore_vm_cleanup session_id=$session_id");
 
@@ -457,35 +420,14 @@ sub restore_vm_cleanup {
     };
     $self->_log('warn', "DpxPlugin: restore cleanup failed: $@") if $@;
 
-    delete $self->{restore_session_id};
-    delete $self->{restore_volname};
-    delete $self->{restore_source_vmid};
+    delete $self->{restore}{$volname};
     return undef;
 }
 
 sub archive_get_guest_config {
     my ($self, $volname) = @_;
-    # Guest config is stored as vm-config.json in the backup directory
-    my $vmid = $self->{restore_source_vmid};
-    return undef unless defined $vmid;
-
-    my $storage_path = $self->{scfg}{path} // '';
-    my $config_path  = "$storage_path/vm-$vmid/vm-config.json";
-    return undef unless -r $config_path;
-
-    open(my $fh, '<', $config_path) or return undef;
-    local $/;
-    my $raw = <$fh>;
-    close $fh;
-
-    my $parsed = eval { decode_json($raw) };
-    return undef if $@;
-
-    if (ref($parsed) eq 'HASH' && exists $parsed->{vmConfig}) {
-        my $cfg = $parsed->{vmConfig};
-        return ref($cfg) ? encode_json($cfg) : $cfg;
-    }
-    return $raw;
+    my $restore = $self->{restore}{$volname} or return undef;
+    return $restore->{guest_config};
 }
 
 sub archive_get_firewall_config {
@@ -493,21 +435,35 @@ sub archive_get_firewall_config {
     return undef;
 }
 
-# -------------------------------------------------------------------------
-# Internal helpers
-# -------------------------------------------------------------------------
+sub _assert_mounted {
+    my ($path) = @_;
+    my $out = `findmnt --target "$path" 2>/dev/null`;
+    die "DpxPlugin: path '$path' is not a mountpoint (NFS not mounted?)"
+        unless defined $out && $out =~ /\S/;
+    return 1;
+}
 
-sub _parse_vmid_from_volname {
-    my ($volname) = @_;
-    # Strip storage prefix and archive extension
-    my $bare = $volname;
-    $bare =~ s{^[^:]+:backup/}{};
-    $bare =~ s{\.vma(?:\..+)?$}{};
-    # Expected: snap-<snapshotId>-vm-<vmid>
-    if ($bare =~ /-vm-(\d+)$/) {
-        return $1;
+sub _reconcile_inventory {
+    my ($manifest_disks, $fs_sizes) = @_;
+    my %inv;
+    for my $disk (@{$manifest_disks // []}) {
+        my $device = $disk->{device};
+        my $expected = $disk->{size_bytes} // $disk->{sizeBytes};
+        die "DpxPlugin: manifest disk missing device name"
+            unless defined $device;
+        die "DpxPlugin: manifest disk '$device' missing size"
+            unless defined $expected;
+        my $key = (defined $disk->{image_name} && length $disk->{image_name})
+            ? $disk->{image_name}
+            : $device;
+        die "DpxPlugin: manifest disk '$device' (image '$key') missing on disk"
+            unless exists $fs_sizes->{$key};
+        my $actual = $fs_sizes->{$key};
+        die "DpxPlugin: size mismatch for '$device' (manifest=$expected on-disk=$actual)"
+            unless $actual == $expected;
+        $inv{$key} = { size => $actual + 0 };
     }
-    die "DpxPlugin: cannot parse vmid from volname '$volname'";
+    return \%inv;
 }
 
 1;
