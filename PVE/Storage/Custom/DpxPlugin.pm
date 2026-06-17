@@ -33,6 +33,11 @@ sub properties {
             type        => 'string',
             optional    => 1,
         },
+        'dpx-restore-token' => {
+            description => 'Per-restore authorization token issued by the DPX catalog at dispatch',
+            type        => 'string',
+            optional    => 1,
+        },
     };
 }
 
@@ -40,8 +45,9 @@ sub options {
     my $parent_opts = PVE::Storage::NFSPlugin->options();
     return {
         %$parent_opts,
-        'dpx-endpoint' => { fixed => 1 },
-        'dpx-node-ip'  => { optional => 1 },
+        'dpx-endpoint'      => { fixed => 1 },
+        'dpx-node-ip'       => { optional => 1 },
+        'dpx-restore-token' => { optional => 1 },
     };
 }
 

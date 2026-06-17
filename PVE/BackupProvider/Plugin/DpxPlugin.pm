@@ -332,9 +332,10 @@ sub restore_vm_init {
     $self->_log('info', "DpxPlugin: restore_vm_init volname=$volname storeid=" . ($self->{storeid} // 'undef'));
 
     my $resp = $self->{http}->post('/proxmox/restore/init', {
-        volname     => $volname,
-        pve_node_ip => $self->{node_ip},
-        storeid     => $self->{storeid},
+        volname             => $volname,
+        pve_node_ip         => $self->{node_ip},
+        storeid             => $self->{storeid},
+        'dpx-restore-token' => $self->{scfg}{'dpx-restore-token'},
     });
 
     die "DpxPlugin: /proxmox/restore/init did not return a JSON object"
