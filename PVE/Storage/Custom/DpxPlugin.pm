@@ -38,6 +38,11 @@ sub properties {
             type        => 'string',
             optional    => 1,
         },
+        'dpx-job-token' => {
+            description => 'Per-job authorization token issued by the DPX catalog at provision, sent as X-DPX-Job-Token on backup callbacks',
+            type        => 'string',
+            optional    => 1,
+        },
     };
 }
 
@@ -48,6 +53,7 @@ sub options {
         'dpx-endpoint'      => { fixed => 1 },
         'dpx-node-ip'       => { optional => 1 },
         'dpx-restore-token' => { optional => 1 },
+        'dpx-job-token'     => { optional => 1 },
     };
 }
 

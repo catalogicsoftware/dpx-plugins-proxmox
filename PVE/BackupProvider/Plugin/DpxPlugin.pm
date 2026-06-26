@@ -27,13 +27,20 @@ sub new {
         ? $scfg->{'dpx-node-ip'}
         : _resolve_node_ip();
 
+    # The catalog provisions the per-job token onto the storage config, so the
+    # plugin HAS it before job_init and sends it as X-DPX-Job-Token on every
+    # backup callback (gateway auth). It no longer relies on job/init to mint one.
+    my $job_token = (defined $scfg->{'dpx-job-token'} && length $scfg->{'dpx-job-token'})
+        ? $scfg->{'dpx-job-token'}
+        : undef;
+
     return bless {
         scfg        => $scfg,
         storeid     => $storeid,
         log         => $log_function,
         http        => DpxVstor::HttpClient->new(endpoint => $endpoint),
         node_ip     => $node_ip,
-        job_token     => undef,
+        job_token     => $job_token,
         disk_stats    => {},
     }, $class;
 }
@@ -63,7 +70,7 @@ sub job_init {
     my $resp = $self->{http}->post('/proxmox/callback/job/init', {
         storeid       => $self->{storeid},
         pluginVersion => DpxVstor::PluginVersion::deb_version(),
-    });
+    }, job_token => $self->{job_token});
     my $token = $resp->{jobRunToken}
         or die "DpxPlugin: no jobRunToken in job/init response";
     $self->{job_token} = $token;
@@ -91,7 +98,7 @@ sub job_cleanup {
             storeid => $self->{storeid},
             token   => $token,
             disks   => \%disks_map,
-        });
+        }, job_token => $self->{job_token});
     };
     $self->_log('warn', "DpxPlugin: job-done callback failed: $@") if $@;
 
@@ -132,7 +139,8 @@ sub backup_vm_query_incremental {
 
     my $fetch_modes = sub {
         my ($query) = @_;
-        return $self->{http}->get('/proxmox/callback/disk-mode' . $query);
+        return $self->{http}->get('/proxmox/callback/disk-mode' . $query,
+            job_token => $self->{job_token});
     };
 
     return _resolve_query_incremental_modes(
@@ -239,7 +247,7 @@ sub backup_vm {
                 bitmapName    => $bitmap_name,
                 sizeBytes     => $size_bytes + 0,
                 baselineGenId => $baseline_genid,
-            });
+            }, job_token => $self->{job_token});
             if (ref($resp) eq 'HASH') {
                 $disk_start_action = $resp->{action};
                 if (defined $resp->{genId} && $resp->{genId} ne '') {
@@ -303,7 +311,7 @@ sub backup_vm {
                 allocatedBytes   => $integ->{allocated_bytes} + 0,
                 punchedZeroBytes => $punched_zero_bytes + 0,
                 message          => $integ->{message} // '',
-            });
+            }, job_token => $self->{job_token});
         };
         $self->_log('warn',
             "DpxPlugin: integrity-result POST failed for $device (catalog will "
