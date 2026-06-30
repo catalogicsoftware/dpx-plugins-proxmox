@@ -84,20 +84,13 @@ sub job_cleanup {
 
     $self->_log('info', "DpxPlugin: job_cleanup token=$token");
 
-    my %disks_map;
-    for my $device (sort keys %{$self->{disk_stats}}) {
-        my $bytes = $self->{disk_stats}{$device} + 0;
-        $disks_map{$device} = {
-            bytesWritten => $bytes,
-            fileSize     => $bytes,
-        };
-    }
+    my $disks_map = _build_disks_map($self->{disk_stats});
 
     eval {
         $self->{http}->post('/proxmox/callback/job-done', {
             storeid => $self->{storeid},
             token   => $token,
-            disks   => \%disks_map,
+            disks   => $disks_map,
         }, job_token => $self->{job_token});
     };
     $self->_log('warn', "DpxPlugin: job-done callback failed: $@") if $@;
@@ -187,6 +180,19 @@ sub _resolve_query_incremental_modes {
         $res{$device} = (defined $mode && $mode eq 'use') ? 'use' : 'new';
     }
     return \%res;
+}
+
+sub _build_disks_map {
+    my ($disk_stats) = @_;
+    my %disks_map;
+    for my $device (sort keys %{$disk_stats}) {
+        my $stat = $disk_stats->{$device} // {};
+        $disks_map{$device} = {
+            bytesWritten => ($stat->{bytes_written} // 0) + 0,
+            fileSize     => ($stat->{file_size} // 0) + 0,
+        };
+    }
+    return \%disks_map;
 }
 
 sub _uri_escape {
@@ -286,7 +292,7 @@ sub backup_vm {
                 log         => $self->{log},
             );
             $transfer_summary = {} unless ref($transfer_summary) eq 'HASH';
-            $bytes_written = -s $target_path // 0;
+            $bytes_written = $transfer_summary->{bytes_written} // 0;
         };
         if ($@) {
             die "DpxPlugin: NbdTransfer failed for $device: $@";
@@ -324,7 +330,10 @@ sub backup_vm {
             "DpxPlugin: %s done bytes_written=%d file_size=%d",
             $device, $bytes_written, $file_size));
 
-        $self->{disk_stats}{$device} = $bytes_written;
+        $self->{disk_stats}{$device} = {
+            bytes_written => $bytes_written,
+            file_size     => $file_size,
+        };
     }
 
     return undef;
