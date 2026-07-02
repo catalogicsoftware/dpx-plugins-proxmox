@@ -125,8 +125,8 @@ sub backup_vm_query_incremental {
     my $read_genid = sub {
         my ($device) = @_;
         return undef unless defined $storage_path;
-        my $genid_path =
-            DpxVstor::GenIdSidecar::sidecar_path($storage_path, $vmid, $device);
+        my $genid_path = DpxVstor::GenIdSidecar::sidecar_path(
+            $storage_path, $vmid, _drive_file_stem($device));
         return DpxVstor::GenIdSidecar::read_genid($genid_path);
     };
 
@@ -202,15 +202,56 @@ sub _uri_escape {
     return $value;
 }
 
+# QEMU/QMP hands us its own internal block-device id (e.g. "drive-scsi0") as
+# the device key for backup_vm/backup_vm_query_incremental and echoes the same
+# string back via restore_vm_volume_init's $device_name. That literal value is
+# load-bearing on the wire: it doubles as the NBD export name during backup
+# (must match what QEMU created) and, via the "#qmdump#map" line embedded in
+# vm_config by the catalog, is looked up verbatim by PVE's own restore code to
+# resolve which guest disk slot a restored volume belongs to. It is NOT,
+# however, load-bearing for OUR OWN storage-layer file/sidecar naming, which is
+# purely a local implementation detail. Strip the QEMU-internal "drive-"
+# prefix only when deriving our own on-disk stem, never when talking to PVE or
+# posting the "device" field back to the catalog.
+sub _drive_file_stem {
+    my ($device) = @_;
+    return $device unless defined $device;
+    $device =~ s/^drive-//;
+    return $device;
+}
+
 sub backup_handle_log_file {
     my ($self, $vmid, $log) = @_;
     return undef;
+}
+
+# Parses the raw text of qemu-server/<vmid>.conf and returns a { slot => volid }
+# map for disk-bus lines (scsiN/virtioN/ideN/sataN). A matching line looks like
+# "scsi0: local-lvm:vm-100-disk-0,size=32G" — the volid is everything between
+# the first ":" and the first "," (or end of line). Lines whose value is the
+# literal "none" (e.g. an empty ide cdrom: "ide2: none,media=cdrom") yield no
+# volid for that slot. Non-disk-bus lines (net0, etc.) are ignored.
+sub _parse_volid_by_slot {
+    my ($guest_config) = @_;
+    my %volid_by_slot;
+    return \%volid_by_slot unless defined $guest_config;
+
+    for my $line (split /\n/, $guest_config) {
+        if ($line =~ /^\s*((?:scsi|virtio|ide|sata)\d+)\s*:\s*([^,]*)/) {
+            my ($slot, $value) = ($1, $2);
+            $value =~ s/\s+$//;
+            $volid_by_slot{$slot} = ($value eq 'none' || $value eq '') ? undef : $value;
+        }
+    }
+    return \%volid_by_slot;
 }
 
 sub backup_vm {
     my ($self, $vmid, $guest_config, $volumes, $info) = @_;
     my $token = $self->{job_token}
         or die "DpxPlugin: backup_vm called without job_token (job_init not called?)";
+
+    my %volid_by_slot = %{ _parse_volid_by_slot($guest_config) };
 
     for my $device (sort keys %$volumes) {
         my $vol         = $volumes->{$device};
@@ -227,19 +268,23 @@ sub backup_vm {
             $transfer_action = 'base';
         }
 
-        $self->_log('info', sprintf(
-            "DpxPlugin: backup_vm vmid=%s device=%s size=%s bitmap-mode=%s bitmap=%s action=%s",
-            $vmid, $device, $size_bytes, $bitmap_mode, $bitmap_name, $transfer_action));
-
         my $storage_path = $self->{scfg}{path}
             or die "DpxPlugin: no path in scfg (NFS not mounted?)";
+        my $file_stem   = _drive_file_stem($device);
+        my $source_volid = $volid_by_slot{$file_stem};
+
+        $self->_log('info', sprintf(
+            "DpxPlugin: backup_vm vmid=%s device=%s size=%s bitmap-mode=%s bitmap=%s action=%s source_volid=%s",
+            $vmid, $device, $size_bytes, $bitmap_mode, $bitmap_name, $transfer_action,
+            ($source_volid // 'undef')));
+
         my $target_dir  = "$storage_path/vm-$vmid";
-        my $target_path = "$target_dir/$device.img";
+        my $target_path = "$target_dir/$file_stem.raw";
 
         make_path($target_dir) unless -d $target_dir;
 
         my $genid_path = DpxVstor::GenIdSidecar::sidecar_path(
-            $storage_path, $vmid, $device);
+            $storage_path, $vmid, $file_stem);
         my $baseline_genid = DpxVstor::GenIdSidecar::read_genid($genid_path);
 
         my $disk_start_action;
@@ -253,6 +298,7 @@ sub backup_vm {
                 bitmapName    => $bitmap_name,
                 sizeBytes     => $size_bytes + 0,
                 baselineGenId => $baseline_genid,
+                sourceVolid   => $source_volid,
             }, job_token => $self->{job_token});
             if (ref($resp) eq 'HASH') {
                 $disk_start_action = $resp->{action};
@@ -384,15 +430,16 @@ sub restore_vm_init {
     my %fs_sizes;
     if (-d $vm_dir) {
         opendir(my $dh, $vm_dir) or die "cannot opendir $vm_dir: $!";
-        while (my $entry = readdir($dh)) {
-            next unless $entry =~ /^(.+)\.img$/;
+        my @entries = readdir($dh);
+        closedir $dh;
+        for my $entry (@entries) {
+            next unless $entry =~ /^(.+)\.raw$/;
             my $device = $1;
             my @st = stat("$vm_dir/$entry") or next;
             my ($sz) = ($st[7] =~ /^(\d+)$/)
                 or die "DpxPlugin: bad size for $entry";
             $fs_sizes{$device} = $sz;
         }
-        closedir $dh;
     }
 
     my $inv = _reconcile_inventory($resp->{disks}, \%fs_sizes);
@@ -411,12 +458,12 @@ sub restore_vm_volume_init {
         or die "DpxPlugin: no path in scfg";
     my ($safe_device) = ($device_name =~ /^([\w.\-]+)$/)
         or die "DpxPlugin: invalid device name '$device_name'";
-    my $img_path  = "$storage_path/vm-$vmid/$safe_device.img";
+    my $raw_path = "$storage_path/vm-$vmid/" . _drive_file_stem($safe_device) . '.raw';
 
-    die "DpxPlugin: image not found at $img_path" unless -f $img_path;
+    die "DpxPlugin: image not found at $raw_path" unless -f $raw_path;
 
-    $self->_log('info', "DpxPlugin: restore_vm_volume_init device=$device_name path=$img_path");
-    return { 'qemu-img-path' => $img_path };
+    $self->_log('info', "DpxPlugin: restore_vm_volume_init device=$device_name path=$raw_path");
+    return { 'qemu-img-path' => $raw_path };
 }
 
 sub restore_vm_volume_cleanup {
@@ -471,12 +518,19 @@ sub _reconcile_inventory {
             unless defined $device;
         die "DpxPlugin: manifest disk '$device' missing size"
             unless defined $expected;
+        # $key is what we hand back to PVE as the restore inventory key; PVE
+        # echoes it back unchanged via restore_vm_volume_init and also matches
+        # it verbatim against the "#qmdump#map" devname baked into vm_config,
+        # so it MUST stay whatever the manifest gave us (drive-prefixed or
+        # not). Our own on-disk filename is a separate, local concern and is
+        # always stored under the drive-stripped stem — so look it up there.
         my $key = (defined $disk->{image_name} && length $disk->{image_name})
             ? $disk->{image_name}
             : $device;
+        my $file_stem = _drive_file_stem($key);
         die "DpxPlugin: manifest disk '$device' (image '$key') missing on disk"
-            unless exists $fs_sizes->{$key};
-        my $actual = $fs_sizes->{$key};
+            unless exists $fs_sizes->{$file_stem};
+        my $actual = $fs_sizes->{$file_stem};
         die "DpxPlugin: size mismatch for '$device' (manifest=$expected on-disk=$actual)"
             unless $actual == $expected;
         $inv{$key} = { size => $actual + 0 };
