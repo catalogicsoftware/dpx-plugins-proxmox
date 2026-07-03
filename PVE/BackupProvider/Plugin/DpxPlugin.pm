@@ -125,8 +125,19 @@ sub backup_vm_query_incremental {
     my $read_genid = sub {
         my ($device) = @_;
         return undef unless defined $storage_path;
+        # Genid stem is the FULL slot name (_drive_file_stem: scsi1, virtio1,
+        # ...), NOT the trailing slot digit -- kept symmetric with the write
+        # site in backup_vm. Full slot names are unique within a VM by PVE's
+        # own rules, so they are collision-free; the slot digit is not (scsi1
+        # and virtio1 both reduce to "1" and would share one genid file). Using
+        # $device (the slot) also means this hook, which PVE calls without a
+        # $guest_config, needs no volid resolution: the slot is available on
+        # both paths. This aligns the on-disk genid key with how the catalog
+        # keys baselineGenIdsByDisk (full slot string), so a matching baseline
+        # no longer diverges and force-fulls a reused-digit disk.
+        my $genid_stem = _drive_file_stem($device);
         my $genid_path = DpxVstor::GenIdSidecar::sidecar_path(
-            $storage_path, $vmid, _disk_file_stem($vmid, $device));
+            $storage_path, $vmid, $genid_stem);
         return DpxVstor::GenIdSidecar::read_genid($genid_path);
     };
 
@@ -221,21 +232,31 @@ sub _drive_file_stem {
 }
 
 # On-disk filenames mirror PVE's own native volume-naming shape
-# (vm-<vmid>-disk-<n>.raw) instead of the bus/slot name. The index <n> is the
-# trailing digit run of the slot itself (scsi0 -> 0, virtio3 -> 3, sata1 -> 1)
-# -- NOT an allocation-order counter and NOT derived from how many disks
-# currently exist on the VM. PVE assigns that slot number to the guest and
-# keeps it stable for the disk's whole life, so deriving the index purely
-# from it means a given disk's filename never changes across backup runs
-# regardless of whether OTHER disks on the VM are added or removed later: no
-# renumbering, no dependency on write order.
+# (vm-<vmid>-disk-<n>.raw) instead of the bus/slot name.
 #
-# Caveat: mixed bus types can collide on the same trailing digit (scsi0 and
-# virtio0 both resolve to index 0). Unlike the old <slot>.raw scheme -- where
-# the bus-type letters were part of the filename and collisions were
+# Primary source for <n>: PVE's own storage volid already carries a
+# per-VM-unique disk index (e.g. "local:141/vm-141-disk-4.raw" -> 4), stamped
+# once by PVE's own global, monotonically-increasing per-VM counter at
+# disk-creation time -- completely independent of which bus/slot the disk is
+# later attached to. Two different disks on the same VM NEVER share this
+# number, no matter the bus type, so it is immune to the cross-bus collision
+# below. See _disk_index_from_volid.
+#
+# Fallback (only when no volid is resolvable, e.g. a disk on
+# unmanaged/passthrough storage): the trailing digit run of the slot name
+# itself (scsi0 -> 0, virtio3 -> 3, sata1 -> 1) -- NOT an allocation-order
+# counter and NOT derived from how many disks currently exist on the VM. See
+# _disk_index_from_slot.
+#
+# Caveat (fallback path only): mixed bus types can collide on the same
+# trailing digit (scsi0 and virtio0 both resolve to index 0), which the
+# volid-primary path above does not have. Unlike the old <slot>.raw scheme --
+# where the bus-type letters were part of the filename and collisions were
 # impossible -- callers that process multiple devices for one VM in a single
-# pass MUST guard against this (see the %assigned_index check in backup_vm).
-sub _disk_index {
+# pass still guard against this as defense-in-depth (see the
+# %assigned_index check in backup_vm), since a fallback-derived index could
+# in principle still coincide with another disk's volid-derived index.
+sub _disk_index_from_slot {
     my ($device) = @_;
     my $slot = _drive_file_stem($device);
     my ($idx) = ($slot =~ /(\d+)\s*$/)
@@ -243,9 +264,34 @@ sub _disk_index {
     return $idx;
 }
 
+# Extracts the trailing "vm-<vmid>-disk-<n>" disk index from a PVE storage
+# volid string, e.g. "local:141/vm-141-disk-4.raw" or
+# "local-lvm:vm-141-disk-4" (file-based storages carry an extension after
+# the number; block-based storages like LVM/Ceph don't). The pattern may
+# appear anywhere in the volid. Returns undef if $volid is undef, empty, or
+# doesn't contain the pattern at all.
+sub _disk_index_from_volid {
+    my ($volid) = @_;
+    return undef unless defined $volid && length $volid;
+    my ($idx) = ($volid =~ /vm-\d+-disk-(\d+)(?:\.\w+)?/);
+    return defined $idx ? $idx + 0 : undef;
+}
+
+sub _disk_index {
+    my ($device, $volid) = @_;
+    my $from_volid = _disk_index_from_volid($volid);
+    return $from_volid if defined $from_volid;
+    my $from_slot = _disk_index_from_slot($device);
+    warn sprintf(
+        "DpxPlugin: info: no volid-derived disk index for device '%s' (volid=%s); "
+      . "falling back to slot-digit derivation (index=%s)\n",
+        $device, (defined $volid ? "'$volid'" : 'undef'), $from_slot);
+    return $from_slot;
+}
+
 sub _disk_file_stem {
-    my ($vmid, $device) = @_;
-    return "vm-${vmid}-disk-" . _disk_index($device);
+    my ($vmid, $device, $volid) = @_;
+    return "vm-${vmid}-disk-" . _disk_index($device, $volid);
 }
 
 sub backup_handle_log_file {
@@ -281,13 +327,27 @@ sub backup_vm {
 
     my %volid_by_slot = %{ _parse_volid_by_slot($guest_config) };
 
-    # Tracks which disk index each device has claimed so far in this
-    # backup_vm call. Index-only naming (vm-<vmid>-disk-<n>.raw) can collide
-    # across bus types (scsi0 and virtio0 both -> index 0); the old
-    # <slot>.raw scheme couldn't, since the bus letters were part of the
-    # filename. Fail loudly rather than let one disk's backup silently
-    # overwrite the other's file.
+    # Index-only naming (vm-<vmid>-disk-<n>.raw) can collide across bus types
+    # (scsi0 and virtio0 both -> index 0); the old <slot>.raw scheme couldn't,
+    # since the bus letters were part of the filename. Detect any such
+    # collision across the WHOLE device set up front, before any device's
+    # backup does real work (paths/callbacks/transfers) -- otherwise the
+    # first colliding device to run can finish writing (and clobber a prior
+    # run's valid file) before the loop reaches the second device and dies.
     my %assigned_index;
+    for my $device (sort keys %$volumes) {
+        my $slot        = _drive_file_stem($device);
+        my $volid       = $volid_by_slot{$slot};
+        my $disk_index  = _disk_index($device, $volid);
+        if (exists $assigned_index{$disk_index} && $assigned_index{$disk_index} ne $device) {
+            die sprintf(
+                "DpxPlugin: disk index collision for vmid=%s: devices '%s' and '%s' "
+              . "both resolve to disk index %s (filename vm-%s-disk-%s.raw); refusing "
+              . "to overwrite",
+                $vmid, $assigned_index{$disk_index}, $device, $disk_index, $vmid, $disk_index);
+        }
+        $assigned_index{$disk_index} = $device;
+    }
 
     for my $device (sort keys %$volumes) {
         my $vol         = $volumes->{$device};
@@ -309,17 +369,7 @@ sub backup_vm {
         my $slot          = _drive_file_stem($device);
         my $source_volid  = $volid_by_slot{$slot};
 
-        my $disk_index = _disk_index($device);
-        if (exists $assigned_index{$disk_index} && $assigned_index{$disk_index} ne $device) {
-            die sprintf(
-                "DpxPlugin: disk index collision for vmid=%s: devices '%s' and '%s' "
-              . "both resolve to disk index %s (filename vm-%s-disk-%s.raw); refusing "
-              . "to overwrite",
-                $vmid, $assigned_index{$disk_index}, $device, $disk_index, $vmid, $disk_index);
-        }
-        $assigned_index{$disk_index} = $device;
-
-        my $file_stem = _disk_file_stem($vmid, $device);
+        my $file_stem = _disk_file_stem($vmid, $device, $source_volid);
 
         $self->_log('info', sprintf(
             "DpxPlugin: backup_vm vmid=%s device=%s size=%s bitmap-mode=%s bitmap=%s action=%s source_volid=%s",
@@ -331,8 +381,22 @@ sub backup_vm {
 
         make_path($target_dir) unless -d $target_dir;
 
+        # Genid stem is the FULL slot name (_drive_file_stem: scsi1, virtio1,
+        # ...), NOT the trailing slot digit. Full slot names are unique within
+        # a VM by PVE's own rules, so they are collision-free -- unlike the
+        # slot digit, where scsi1 and virtio1 both reduce to "1" and would
+        # clobber a shared vm-<vmid>-disk-1.genid (last-writer-wins). $device
+        # (the slot) is available in BOTH backup_vm and
+        # backup_vm_query_incremental (unlike the volid, which needs
+        # $guest_config that the query path never receives), so the read and
+        # write sites derive the identical filename. This also matches how the
+        # catalog keys baselineGenIdsByDisk (by full slot string), aligning the
+        # plugin's on-disk genid key with the catalog's model. The genid stem
+        # is deliberately independent of the image-file stem ($file_stem,
+        # volid-based) -- nothing requires them to match.
+        my $genid_stem = _drive_file_stem($device);
         my $genid_path = DpxVstor::GenIdSidecar::sidecar_path(
-            $storage_path, $vmid, $file_stem);
+            $storage_path, $vmid, $genid_stem);
         my $baseline_genid = DpxVstor::GenIdSidecar::read_genid($genid_path);
 
         my $disk_start_action;
@@ -462,10 +526,24 @@ sub restore_vm_init {
     my ($source_vmid) = (($resp->{vmid} // '') =~ /^(\d+)$/)
         or die "DpxPlugin: invalid vmid in /proxmox/restore/init response: " . ($resp->{vmid} // 'undef');
 
+    # Cache a per-device volid map alongside the session: restore_vm_volume_init
+    # only receives $device_name (not the manifest), so it needs this to look
+    # up the same sourceVolid _reconcile_inventory used, keeping the volid
+    # resolution symmetric with the backup_vm write path.
+    my %volid_by_device;
+    for my $disk (@{ $resp->{disks} }) {
+        my $key = (defined $disk->{image_name} && length $disk->{image_name})
+            ? $disk->{image_name}
+            : $disk->{device};
+        next unless defined $key;
+        $volid_by_device{$key} = $disk->{sourceVolid};
+    }
+
     $self->{restore}{$volname} = {
-        session_id   => $session_id,
-        source_vmid  => $source_vmid,
-        guest_config => $resp->{vm_config},
+        session_id      => $session_id,
+        source_vmid     => $source_vmid,
+        guest_config    => $resp->{vm_config},
+        volid_by_device => \%volid_by_device,
     };
     $self->_log('info', "DpxPlugin: vm_config received? " . (defined $resp->{vm_config} ? "yes (" . length($resp->{vm_config}) . " bytes)" : "no"));
     $self->_log('info', "DpxPlugin: restore session_id=$session_id vmid=$source_vmid");
@@ -506,7 +584,8 @@ sub restore_vm_volume_init {
         or die "DpxPlugin: no path in scfg";
     my ($safe_device) = ($device_name =~ /^([\w.\-]+)$/)
         or die "DpxPlugin: invalid device name '$device_name'";
-    my $raw_path = "$storage_path/vm-$vmid/" . _disk_file_stem($vmid, $safe_device) . '.raw';
+    my $volid = $restore->{volid_by_device}{$safe_device};
+    my $raw_path = "$storage_path/vm-$vmid/" . _disk_file_stem($vmid, $safe_device, $volid) . '.raw';
 
     die "DpxPlugin: image not found at $raw_path" unless -f $raw_path;
 
@@ -577,7 +656,8 @@ sub _reconcile_inventory {
         my $key = (defined $disk->{image_name} && length $disk->{image_name})
             ? $disk->{image_name}
             : $device;
-        my $file_stem = _disk_file_stem($vmid, $key);
+        my $volid = $disk->{sourceVolid};
+        my $file_stem = _disk_file_stem($vmid, $key, $volid);
         die "DpxPlugin: manifest disk '$device' (image '$key') missing on disk"
             unless exists $fs_sizes->{$file_stem};
         my $actual = $fs_sizes->{$file_stem};
