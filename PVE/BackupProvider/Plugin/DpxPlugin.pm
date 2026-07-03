@@ -126,7 +126,7 @@ sub backup_vm_query_incremental {
         my ($device) = @_;
         return undef unless defined $storage_path;
         my $genid_path = DpxVstor::GenIdSidecar::sidecar_path(
-            $storage_path, $vmid, _drive_file_stem($device));
+            $storage_path, $vmid, _disk_file_stem($vmid, $device));
         return DpxVstor::GenIdSidecar::read_genid($genid_path);
     };
 
@@ -220,6 +220,34 @@ sub _drive_file_stem {
     return $device;
 }
 
+# On-disk filenames mirror PVE's own native volume-naming shape
+# (vm-<vmid>-disk-<n>.raw) instead of the bus/slot name. The index <n> is the
+# trailing digit run of the slot itself (scsi0 -> 0, virtio3 -> 3, sata1 -> 1)
+# -- NOT an allocation-order counter and NOT derived from how many disks
+# currently exist on the VM. PVE assigns that slot number to the guest and
+# keeps it stable for the disk's whole life, so deriving the index purely
+# from it means a given disk's filename never changes across backup runs
+# regardless of whether OTHER disks on the VM are added or removed later: no
+# renumbering, no dependency on write order.
+#
+# Caveat: mixed bus types can collide on the same trailing digit (scsi0 and
+# virtio0 both resolve to index 0). Unlike the old <slot>.raw scheme -- where
+# the bus-type letters were part of the filename and collisions were
+# impossible -- callers that process multiple devices for one VM in a single
+# pass MUST guard against this (see the %assigned_index check in backup_vm).
+sub _disk_index {
+    my ($device) = @_;
+    my $slot = _drive_file_stem($device);
+    my ($idx) = ($slot =~ /(\d+)\s*$/)
+        or die "DpxPlugin: cannot derive disk index from device '$device' (slot '$slot')";
+    return $idx;
+}
+
+sub _disk_file_stem {
+    my ($vmid, $device) = @_;
+    return "vm-${vmid}-disk-" . _disk_index($device);
+}
+
 sub backup_handle_log_file {
     my ($self, $vmid, $log) = @_;
     return undef;
@@ -253,6 +281,14 @@ sub backup_vm {
 
     my %volid_by_slot = %{ _parse_volid_by_slot($guest_config) };
 
+    # Tracks which disk index each device has claimed so far in this
+    # backup_vm call. Index-only naming (vm-<vmid>-disk-<n>.raw) can collide
+    # across bus types (scsi0 and virtio0 both -> index 0); the old
+    # <slot>.raw scheme couldn't, since the bus letters were part of the
+    # filename. Fail loudly rather than let one disk's backup silently
+    # overwrite the other's file.
+    my %assigned_index;
+
     for my $device (sort keys %$volumes) {
         my $vol         = $volumes->{$device};
         my $size_bytes  = $vol->{size} // 0;
@@ -270,8 +306,20 @@ sub backup_vm {
 
         my $storage_path = $self->{scfg}{path}
             or die "DpxPlugin: no path in scfg (NFS not mounted?)";
-        my $file_stem   = _drive_file_stem($device);
-        my $source_volid = $volid_by_slot{$file_stem};
+        my $slot          = _drive_file_stem($device);
+        my $source_volid  = $volid_by_slot{$slot};
+
+        my $disk_index = _disk_index($device);
+        if (exists $assigned_index{$disk_index} && $assigned_index{$disk_index} ne $device) {
+            die sprintf(
+                "DpxPlugin: disk index collision for vmid=%s: devices '%s' and '%s' "
+              . "both resolve to disk index %s (filename vm-%s-disk-%s.raw); refusing "
+              . "to overwrite",
+                $vmid, $assigned_index{$disk_index}, $device, $disk_index, $vmid, $disk_index);
+        }
+        $assigned_index{$disk_index} = $device;
+
+        my $file_stem = _disk_file_stem($vmid, $device);
 
         $self->_log('info', sprintf(
             "DpxPlugin: backup_vm vmid=%s device=%s size=%s bitmap-mode=%s bitmap=%s action=%s source_volid=%s",
@@ -442,7 +490,7 @@ sub restore_vm_init {
         }
     }
 
-    my $inv = _reconcile_inventory($resp->{disks}, \%fs_sizes);
+    my $inv = _reconcile_inventory($source_vmid, $resp->{disks}, \%fs_sizes);
 
     $self->_log('info', sprintf("DpxPlugin: restore inventory: %d disks", scalar keys %$inv));
     return $inv;
@@ -458,7 +506,7 @@ sub restore_vm_volume_init {
         or die "DpxPlugin: no path in scfg";
     my ($safe_device) = ($device_name =~ /^([\w.\-]+)$/)
         or die "DpxPlugin: invalid device name '$device_name'";
-    my $raw_path = "$storage_path/vm-$vmid/" . _drive_file_stem($safe_device) . '.raw';
+    my $raw_path = "$storage_path/vm-$vmid/" . _disk_file_stem($vmid, $safe_device) . '.raw';
 
     die "DpxPlugin: image not found at $raw_path" unless -f $raw_path;
 
@@ -509,7 +557,7 @@ sub _assert_mounted {
 }
 
 sub _reconcile_inventory {
-    my ($manifest_disks, $fs_sizes) = @_;
+    my ($vmid, $manifest_disks, $fs_sizes) = @_;
     my %inv;
     for my $disk (@{$manifest_disks // []}) {
         my $device = $disk->{device};
@@ -522,12 +570,14 @@ sub _reconcile_inventory {
         # echoes it back unchanged via restore_vm_volume_init and also matches
         # it verbatim against the "#qmdump#map" devname baked into vm_config,
         # so it MUST stay whatever the manifest gave us (drive-prefixed or
-        # not). Our own on-disk filename is a separate, local concern and is
-        # always stored under the drive-stripped stem — so look it up there.
+        # not). Our own on-disk filename is a separate, local concern: it is
+        # derived forward from the device string via _disk_file_stem, exactly
+        # symmetric with the write path in backup_vm — no need to
+        # reverse-engineer bus type from a bare numeric filename.
         my $key = (defined $disk->{image_name} && length $disk->{image_name})
             ? $disk->{image_name}
             : $device;
-        my $file_stem = _drive_file_stem($key);
+        my $file_stem = _disk_file_stem($vmid, $key);
         die "DpxPlugin: manifest disk '$device' (image '$key') missing on disk"
             unless exists $fs_sizes->{$file_stem};
         my $actual = $fs_sizes->{$file_stem};
