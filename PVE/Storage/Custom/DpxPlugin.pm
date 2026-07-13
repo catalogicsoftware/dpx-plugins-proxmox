@@ -63,4 +63,23 @@ sub new_backup_provider {
     return PVE::BackupProvider::Plugin::DpxPlugin->new($scfg, $storeid, $log_function);
 }
 
+# PVE's storage delete drops the config entry but leaves the NFS mount at
+# /mnt/pve/<storeid> in place. DPX registers a fresh per-run storage id for
+# every VM backup and deletes it afterwards, so a leftover mount accumulates
+# each run; once the backing vStor export is torn down the mount turns into a
+# stale NFS handle (ESTALE) and blocks any future add of the same storeid.
+# Unmount and remove the mount point here so per-run ids stay reusable.
+sub on_delete_hook {
+    my ($class, $storeid, $scfg) = @_;
+
+    my $path = "/mnt/pve/$storeid";
+    unless (system('umount', $path) == 0) {
+        system('umount', '-f', $path) == 0
+            or system('umount', '-l', $path);
+    }
+    rmdir($path);    # only removes the mount point when empty; leaves any stray data
+
+    return undef;
+}
+
 1;
