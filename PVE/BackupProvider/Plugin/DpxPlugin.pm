@@ -231,67 +231,49 @@ sub _drive_file_stem {
     return $device;
 }
 
-# On-disk filenames mirror PVE's own native volume-naming shape
-# (vm-<vmid>-disk-<n>.raw) instead of the bus/slot name.
+# On-disk image filenames are the disk's PVE storage volid, percent-encoded so
+# it forms a single safe path component. The volid (e.g.
+# "PL-VSTOR-1_NFS:102/vm-102-disk-0.vmdk" or "RAIDZ2:vm-102-disk-0") is unique
+# per VM because it is qualified by the storage id: two disks that each carry
+# the per-storage number "disk-0" on DIFFERENT storages (common for a UEFI VM
+# whose efidisk lives on local ZFS while its data disk lives on NFS) get
+# distinct filenames -- unlike the old "vm-<vmid>-disk-<n>" scheme, which
+# dropped the storage and collapsed both onto vm-<vmid>-disk-0.raw.
 #
-# Primary source for <n>: PVE's own storage volid already carries a
-# per-VM-unique disk index (e.g. "local:141/vm-141-disk-4.raw" -> 4), stamped
-# once by PVE's own global, monotonically-increasing per-VM counter at
-# disk-creation time -- completely independent of which bus/slot the disk is
-# later attached to. Two different disks on the same VM NEVER share this
-# number, no matter the bus type, so it is immune to the cross-bus collision
-# below. See _disk_index_from_volid.
-#
-# Fallback (only when no volid is resolvable, e.g. a disk on
-# unmanaged/passthrough storage): the trailing digit run of the slot name
-# itself (scsi0 -> 0, virtio3 -> 3, sata1 -> 1) -- NOT an allocation-order
-# counter and NOT derived from how many disks currently exist on the VM. See
-# _disk_index_from_slot.
-#
-# Caveat (fallback path only): mixed bus types can collide on the same
-# trailing digit (scsi0 and virtio0 both resolve to index 0), which the
-# volid-primary path above does not have. Unlike the old <slot>.raw scheme --
-# where the bus-type letters were part of the filename and collisions were
-# impossible -- callers that process multiple devices for one VM in a single
-# pass still guard against this as defense-in-depth (see the
-# %assigned_index check in backup_vm), since a fallback-derived index could
-# in principle still coincide with another disk's volid-derived index.
-sub _disk_index_from_slot {
-    my ($device) = @_;
-    my $slot = _drive_file_stem($device);
-    my ($idx) = ($slot =~ /(\d+)\s*$/)
-        or die "DpxPlugin: cannot derive disk index from device '$device' (slot '$slot')";
-    return $idx;
+# Fallback (only when no storage volid is resolvable, e.g. a passthrough
+# /dev/... disk): the full slot name, prefixed "slot-" (slot-scsi0,
+# slot-efidisk0). Slot names are unique within a VM by PVE's own rules, and the
+# "slot-" form is provably disjoint from any encoded volid: every encoded volid
+# contains "%3A" (the storeid ':' separator), while a slot name contains no '%'.
+# Restore reconstructs the identical name forward from the recovery point's
+# stored sourceVolid (or, on the fallback path, the manifest device), so the
+# encoding never needs to be decoded.
+
+# A value is a usable PVE storage volid only if it has "<storeid>:<volume>"
+# shape. Rejects undef/empty, "none", and absolute passthrough paths (/dev/...,
+# /mnt/...), which take the slot-name fallback instead of being encoded.
+sub _is_storage_volid {
+    my ($value) = @_;
+    return 0 unless defined $value && length $value;
+    return 0 if $value =~ m{^/};
+    return $value =~ /:/ ? 1 : 0;
 }
 
-# Extracts the trailing "vm-<vmid>-disk-<n>" disk index from a PVE storage
-# volid string, e.g. "local:141/vm-141-disk-4.raw" or
-# "local-lvm:vm-141-disk-4" (file-based storages carry an extension after
-# the number; block-based storages like LVM/Ceph don't). The pattern may
-# appear anywhere in the volid. Returns undef if $volid is undef, empty, or
-# doesn't contain the pattern at all.
-sub _disk_index_from_volid {
+# Percent-encode a volid into a single safe filename component: every byte
+# outside the unreserved set [A-Za-z0-9._-] becomes uppercase %XX. Deterministic
+# and injective; a volid never contains '%', so the mapping is unambiguous and
+# needs no decode on the restore side.
+sub _volid_to_filename {
     my ($volid) = @_;
-    return undef unless defined $volid && length $volid;
-    my ($idx) = ($volid =~ /vm-\d+-disk-(\d+)(?:\.\w+)?/);
-    return defined $idx ? $idx + 0 : undef;
-}
-
-sub _disk_index {
-    my ($device, $volid) = @_;
-    my $from_volid = _disk_index_from_volid($volid);
-    return $from_volid if defined $from_volid;
-    my $from_slot = _disk_index_from_slot($device);
-    warn sprintf(
-        "DpxPlugin: info: no volid-derived disk index for device '%s' (volid=%s); "
-      . "falling back to slot-digit derivation (index=%s)\n",
-        $device, (defined $volid ? "'$volid'" : 'undef'), $from_slot);
-    return $from_slot;
+    $volid = '' unless defined $volid;
+    $volid =~ s/([^A-Za-z0-9_.-])/sprintf('%%%02X', ord($1))/ge;
+    return $volid;
 }
 
 sub _disk_file_stem {
     my ($vmid, $device, $volid) = @_;
-    return "vm-${vmid}-disk-" . _disk_index($device, $volid);
+    return _volid_to_filename($volid) if _is_storage_volid($volid);
+    return 'slot-' . _drive_file_stem($device);
 }
 
 sub backup_handle_log_file {
@@ -300,21 +282,24 @@ sub backup_handle_log_file {
 }
 
 # Parses the raw text of qemu-server/<vmid>.conf and returns a { slot => volid }
-# map for disk-bus lines (scsiN/virtioN/ideN/sataN). A matching line looks like
-# "scsi0: local-lvm:vm-100-disk-0,size=32G" — the volid is everything between
-# the first ":" and the first "," (or end of line). Lines whose value is the
-# literal "none" (e.g. an empty ide cdrom: "ide2: none,media=cdrom") yield no
-# volid for that slot. Non-disk-bus lines (net0, etc.) are ignored.
+# map for disk-bus lines (scsiN/virtioN/ideN/sataN/efidiskN/tpmstateN). A
+# matching line looks like "scsi0: local-lvm:vm-100-disk-0,size=32G" — the volid
+# is everything between the first ":" and the first "," (or end of line).
+# efidisk0/tpmstate0 must be included: they are real backed-up disks and their
+# volid is what names their on-disk image. Values without storage-volid shape
+# (the literal "none" of an empty cdrom, or a passthrough /dev/... path) yield
+# an undef volid for that slot, so the image falls back to slot-name naming.
+# Non-disk-bus lines (net0, etc.) are ignored.
 sub _parse_volid_by_slot {
     my ($guest_config) = @_;
     my %volid_by_slot;
     return \%volid_by_slot unless defined $guest_config;
 
     for my $line (split /\n/, $guest_config) {
-        if ($line =~ /^\s*((?:scsi|virtio|ide|sata)\d+)\s*:\s*([^,]*)/) {
+        if ($line =~ /^\s*((?:scsi|virtio|ide|sata|efidisk|tpmstate)\d+)\s*:\s*([^,]*)/) {
             my ($slot, $value) = ($1, $2);
             $value =~ s/\s+$//;
-            $volid_by_slot{$slot} = ($value eq 'none' || $value eq '') ? undef : $value;
+            $volid_by_slot{$slot} = _is_storage_volid($value) ? $value : undef;
         }
     }
     return \%volid_by_slot;
@@ -327,26 +312,26 @@ sub backup_vm {
 
     my %volid_by_slot = %{ _parse_volid_by_slot($guest_config) };
 
-    # Index-only naming (vm-<vmid>-disk-<n>.raw) can collide across bus types
-    # (scsi0 and virtio0 both -> index 0); the old <slot>.raw scheme couldn't,
-    # since the bus letters were part of the filename. Detect any such
-    # collision across the WHOLE device set up front, before any device's
-    # backup does real work (paths/callbacks/transfers) -- otherwise the
-    # first colliding device to run can finish writing (and clobber a prior
-    # run's valid file) before the loop reaches the second device and dies.
-    my %assigned_index;
+    # Two disks that resolve to the same on-disk filename would clobber each
+    # other. Volid-based names make this impossible for real volids (storage-
+    # qualified, unique per VM) and for slot-name fallbacks (unique per VM), but
+    # detect any clash across the WHOLE device set up front, before any device's
+    # backup does real work (paths/callbacks/transfers) -- defense-in-depth,
+    # since the first colliding device to run could otherwise finish writing
+    # (and clobber a prior run's valid file) before the loop reaches the second
+    # device and dies.
+    my %assigned_stem;
     for my $device (sort keys %$volumes) {
-        my $slot        = _drive_file_stem($device);
-        my $volid       = $volid_by_slot{$slot};
-        my $disk_index  = _disk_index($device, $volid);
-        if (exists $assigned_index{$disk_index} && $assigned_index{$disk_index} ne $device) {
+        my $slot   = _drive_file_stem($device);
+        my $volid  = $volid_by_slot{$slot};
+        my $stem   = _disk_file_stem($vmid, $device, $volid);
+        if (exists $assigned_stem{$stem} && $assigned_stem{$stem} ne $device) {
             die sprintf(
-                "DpxPlugin: disk index collision for vmid=%s: devices '%s' and '%s' "
-              . "both resolve to disk index %s (filename vm-%s-disk-%s.raw); refusing "
-              . "to overwrite",
-                $vmid, $assigned_index{$disk_index}, $device, $disk_index, $vmid, $disk_index);
+                "DpxPlugin: on-disk name collision for vmid=%s: devices '%s' and '%s' "
+              . "both resolve to filename '%s.raw'; refusing to overwrite",
+                $vmid, $assigned_stem{$stem}, $device, $stem);
         }
-        $assigned_index{$disk_index} = $device;
+        $assigned_stem{$stem} = $device;
     }
 
     for my $device (sort keys %$volumes) {
