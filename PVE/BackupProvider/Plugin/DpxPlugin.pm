@@ -18,6 +18,17 @@ use DpxVstor::PluginVersion;
 use DpxVstor::IntegrityGate;
 use DpxVstor::GenIdSidecar;
 
+# Host-local switch for per-extent tracing. Support turns it on, on the node
+# that misbehaves, with:
+#     mkdir -p /etc/dpx
+#     echo 'debug: 1' > /etc/dpx/proxmox-plugin.conf
+# It takes effect on the next VM backup, because a fresh provider is built per
+# run: no daemon restart, and no DPX-side change or deploy. It is deliberately
+# NOT a dpkg conffile (the .deb ships nothing under /etc), so a plugin upgrade
+# or reinstall never touches it. Missing file, unreadable file, or any other
+# value means off, and a malformed file must never be able to fail a backup.
+our $DEBUG_CONF = '/etc/dpx/proxmox-plugin.conf';
+
 sub new {
     my ($class, $scfg, $storeid, $log_function) = @_;
     my $endpoint = $scfg->{'dpx-endpoint'}
@@ -34,7 +45,7 @@ sub new {
         ? $scfg->{'dpx-job-token'}
         : undef;
 
-    return bless {
+    my $self = bless {
         scfg        => $scfg,
         storeid     => $storeid,
         log         => $log_function,
@@ -42,7 +53,15 @@ sub new {
         node_ip     => $node_ip,
         job_token     => $job_token,
         disk_stats    => {},
+        debug         => _read_debug_flag(),
     }, $class;
+
+    # Announced here rather than in job_init so restore reports it too: restore
+    # builds a provider but never calls job_init.
+    $self->_log('info', "DpxPlugin: debug tracing ENABLED by $DEBUG_CONF")
+        if $self->{debug};
+
+    return $self;
 }
 
 sub provider_name { return 'DPX catalog incremental'; }
@@ -57,6 +76,26 @@ sub _resolve_node_ip {
 sub _log {
     my ($self, $level, $msg) = @_;
     $self->{log}->($level, $msg);
+}
+
+sub _read_debug_flag {
+    my ($path) = @_;
+    $path = $DEBUG_CONF unless defined $path;
+    open(my $fh, '<', $path) or return 0;
+    my $on = 0;
+    while (my $line = <$fh>) {
+        next if $line =~ /^\s*#/;
+        next unless $line =~ /^\s*debug\s*[:=]\s*(\S+)/;
+        $on = ($1 =~ /^(?:1|true|yes|on)$/i) ? 1 : 0;   # last key wins
+    }
+    close($fh);
+    return $on;
+}
+
+sub _debug {
+    my ($self, $msg) = @_;
+    return unless $self->{debug};
+    $self->{log}->('info', $msg);
 }
 
 sub backup_get_mechanism {
@@ -74,7 +113,10 @@ sub job_init {
     my $token = $resp->{jobRunToken}
         or die "DpxPlugin: no jobRunToken in job/init response";
     $self->{job_token} = $token;
-    $self->_log('info', "DpxPlugin: job_init token=$token");
+    # Never log the token itself: PVE includes task-log tails in backup
+    # notification mail, so it would leave the cluster. storeid already
+    # identifies the run uniquely.
+    $self->_log('info', "DpxPlugin: job_init acquired job run token storeid=$self->{storeid}");
     return undef;
 }
 
@@ -82,7 +124,7 @@ sub job_cleanup {
     my ($self) = @_;
     my $token = $self->{job_token} or return undef;
 
-    $self->_log('info', "DpxPlugin: job_cleanup token=$token");
+    $self->_log('info', "DpxPlugin: job_cleanup storeid=$self->{storeid}");
 
     my $disks_map = _build_disks_map($self->{disk_stats});
 
@@ -110,10 +152,12 @@ sub backup_cleanup {
     if ($success) {
         return { stats => { 'archive-size' => 0 } };
     }
-    $self->_log('warn', sprintf(
-        "DpxPlugin: backup FAILED for vmid=%s (token=%s) — no job-done sent; "
+    # 'err', not 'warn': this branch runs only when PVE has already failed the
+    # VM, so amber would understate a red task. Token omitted deliberately.
+    $self->_log('err', sprintf(
+        "DpxPlugin: backup FAILED for vmid=%s storeid=%s - no job-done sent; "
         . "catalog will discard this run on timeout",
-        $vmid, ($self->{job_token} // 'none')));
+        $vmid, $self->{storeid}));
     return {};
 }
 
@@ -334,6 +378,15 @@ sub backup_vm {
         $assigned_stem{$stem} = $device;
     }
 
+    # PVE reports no byte progress for provider backups (its query-backup loop
+    # runs only on the PBS/VMA paths), so the plugin reports it. Both figures are
+    # VM-wide: the catalog keeps one task per VM, and a per-disk counter would
+    # march backwards whenever a multi-disk VM moved on to the next disk.
+    my $vm_total_bytes = 0;
+    $vm_total_bytes += ($volumes->{$_}{size} // 0) for keys %$volumes;
+    my $vm_done_bytes = 0;
+    my $vm_started_at = time();
+
     for my $device (sort keys %$volumes) {
         my $vol         = $volumes->{$device};
         my $size_bytes  = $vol->{size} // 0;
@@ -410,7 +463,11 @@ sub backup_vm {
         if (defined $disk_start_action
             && $disk_start_action eq 'base'
             && $bitmap_mode eq 'reuse') {
-            $self->_log('warn', sprintf(
+            # 'info', not 'warn': this backstop fires legitimately whenever the
+            # catalog's chain state moves independently of PVE's bitmap (base
+            # expired by retention, new job) and it still produces a correct
+            # full. Amber on every post-expiry run would be noise.
+            $self->_log('info', sprintf(
                 "DpxPlugin: catalog forced full for %s but PVE handed bitmap-mode=reuse; "
               . "overriding to full rebuild (data-path backstop)", $device));
             $effective_bitmap_mode = 'new';
@@ -433,6 +490,11 @@ sub backup_vm {
                 export_name => $device,
                 size_bytes  => $size_bytes,
                 log         => $self->{log},
+                debug       => $self->{debug},
+                report_progress         => 1,
+                progress_baseline_bytes => $vm_done_bytes,
+                progress_total_bytes    => $vm_total_bytes,
+                progress_started_at     => $vm_started_at,
             );
             $transfer_summary = {} unless ref($transfer_summary) eq 'HASH';
             $bytes_written = $transfer_summary->{bytes_written} // 0;
@@ -440,6 +502,11 @@ sub backup_vm {
         if ($@) {
             die "DpxPlugin: NbdTransfer failed for $device: $@";
         }
+
+        # write_bytes is the extent-map total this disk was going to move, i.e.
+        # the same measure the in-transfer reporter counts up to, so the next
+        # disk's baseline continues exactly where this one stopped.
+        $vm_done_bytes += $transfer_summary->{write_bytes} // 0;
 
         my $punched_zero_bytes = $transfer_summary->{punched_zero_bytes} // 0;
         my $integ = DpxVstor::IntegrityGate::check(
