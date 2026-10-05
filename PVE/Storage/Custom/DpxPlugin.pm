@@ -12,7 +12,7 @@ sub type { return 'dpx-vstor'; }
 
 sub plugindata {
     return {
-        content  => [{ backup => 1 }, { backup => 1 }],
+        content  => [{ backup => 1, images => 1 }, { backup => 1 }],
         features => { 'backup-provider' => 1 },
     };
 }
@@ -21,6 +21,18 @@ sub activate_volume    { return 1; }
 sub deactivate_volume  { return 1; }
 sub list_volumes       { return []; }
 sub status             { return (0, 0, 0, 1); }
+
+sub filesystem_path {
+    my ($class, $scfg, $volname, $snapname) = @_;
+    my ($vtype, $name, $vmid) = $class->parse_volname($volname);
+    return $class->SUPER::filesystem_path($scfg, $volname, $snapname) if $vtype ne 'images';
+    my ($src, $stem) = $name =~ /^(\d+)-(.+)$/ or die "dpx-vstor: bad image name '$name'\n";
+    my $path = "$scfg->{path}/vm-$src/$stem";
+    return wantarray ? ($path, $vmid, $vtype) : $path;
+}
+
+sub alloc_image { die "dpx-vstor: images are read-only restore sources\n" }
+sub free_image  { die "dpx-vstor: images are read-only restore sources\n" }
 
 sub properties {
     return {
