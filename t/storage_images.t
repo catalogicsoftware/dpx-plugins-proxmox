@@ -2,7 +2,7 @@
 # Copyright (C) 2026 Catalogic Software, Inc.
 use strict;
 use warnings;
-use Test::More tests => 7;
+use Test::More tests => 10;
 
 BEGIN {
     $INC{'PVE/Storage/NFSPlugin.pm'} = 1;
@@ -17,6 +17,12 @@ BEGIN {
     sub filesystem_path {
         my ($class, $scfg, $volname) = @_;
         return "/base/$volname";
+    }
+    our @freed;
+    sub free_image {
+        my ($class, $storeid, $scfg, $volname, @rest) = @_;
+        push @freed, $volname;
+        return 'parent-freed';
     }
 }
 
@@ -43,3 +49,8 @@ eval { $pkg->alloc_image('s', $scfg, 200, 'raw', undef, 1024) };
 like($@, qr/read-only restore sources/, 'alloc_image refuses');
 eval { $pkg->free_image('s', $scfg, '200/101-slot-scsi0.raw', 0) };
 like($@, qr/read-only restore sources/, 'free_image refuses');
+is_deeply(\@PVE::Storage::NFSPlugin::freed, [], 'refused images volume never reaches the parent');
+is($pkg->free_image('s', $scfg, 'backup/vzdump-qemu-100-2026_01_01-00_00_00.vma.zst', 0),
+    'parent-freed', 'free_image on a backup volume returns the parent result');
+is_deeply(\@PVE::Storage::NFSPlugin::freed, ['backup/vzdump-qemu-100-2026_01_01-00_00_00.vma.zst'],
+    'free_image on a backup volume delegates to the parent');

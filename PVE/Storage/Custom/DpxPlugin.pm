@@ -32,7 +32,13 @@ sub filesystem_path {
 }
 
 sub alloc_image { die "dpx-vstor: images are read-only restore sources\n" }
-sub free_image  { die "dpx-vstor: images are read-only restore sources\n" }
+
+sub free_image {
+    my ($class, $storeid, $scfg, $volname, @rest) = @_;
+    my ($vtype) = $class->parse_volname($volname);
+    die "dpx-vstor: images are read-only restore sources\n" if $vtype eq 'images';
+    return $class->SUPER::free_image($storeid, $scfg, $volname, @rest);
+}
 
 sub properties {
     return {
