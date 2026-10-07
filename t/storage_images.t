@@ -2,12 +2,15 @@
 # Copyright (C) 2026 Catalogic Software, Inc.
 use strict;
 use warnings;
-use Test::More tests => 15;
+use Test::More tests => 18;
+use File::Temp qw(tempdir);
+use File::Path qw(make_path);
 
 BEGIN {
     $INC{'PVE/Cluster.pm'} = 1;
     package PVE::Cluster;
-    sub get_vmlist { return { ids => {} } }
+    our $vmlist = { ids => {} };
+    sub get_vmlist { return $vmlist }
 
     $INC{'PVE/Storage/NFSPlugin.pm'} = 1;
     package PVE::Storage::NFSPlugin;
@@ -74,3 +77,35 @@ is($pkg->volume_has_feature($scfg, 'snapshot', 's', $bak), 'parent-feature',
 eval { $pkg->create_base('s', $scfg, $img) };
 like($@, qr/cannot become a template/, 'create_base refuses images');
 is($pkg->create_base('s', $scfg, $bak), 'parent-base', 'create_base delegates for other volumes');
+
+my $nodes = tempdir(CLEANUP => 1);
+make_path("$nodes/pve1/qemu-server");
+{ no warnings 'once'; $PVE::Storage::Custom::DpxPlugin::NODES_DIR = $nodes; }
+sub write_conf {
+    my ($vmid, $body) = @_;
+    my $f = "$nodes/pve1/qemu-server/$vmid.conf";
+    open(my $fh, '>', $f) or die "cannot write $f: $!";
+    print $fh $body;
+    close($fh);
+    return $f;
+}
+write_conf(200, "scsi0: dpx-restore-x:200/101-slot-scsi0.raw,size=3G\n");
+write_conf(201, "scsi0: local-lvm:vm-201-disk-0,size=3G\n");
+$PVE::Cluster::vmlist = { ids => {
+    200 => { node => 'pve1', type => 'qemu' },
+    201 => { node => 'pve1', type => 'qemu' },
+    202 => { node => 'pve1', type => 'qemu' },
+} };
+is_deeply([PVE::Storage::Custom::DpxPlugin::_guests_using_storage('dpx-restore-x')], [200],
+    'a guest whose config references the storage is reported; a vanished config is skipped');
+my $locked = write_conf(203, "scsi0: dpx-restore-x:203/101-slot-scsi0.raw\n");
+$PVE::Cluster::vmlist->{ids}{203} = { node => 'pve1', type => 'qemu' };
+chmod(0000, $locked);
+SKIP: {
+    skip 'root can read a mode-0000 file', 2 if open(my $probe, '<', $locked);
+    eval { PVE::Storage::Custom::DpxPlugin::_guests_using_storage('dpx-restore-x') };
+    like($@, qr/cannot read \Q$locked\E/, 'an unreadable guest config refuses instead of passing');
+    eval { $pkg->on_delete_hook('dpx-restore-x', $scfg) };
+    like($@, qr/cannot read/, 'the storage delete is refused while a config cannot be read');
+}
+chmod(0600, $locked);

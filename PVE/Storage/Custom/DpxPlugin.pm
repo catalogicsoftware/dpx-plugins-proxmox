@@ -7,6 +7,8 @@ use warnings;
 use PVE::Cluster;
 use base qw(PVE::Storage::NFSPlugin);
 
+our $NODES_DIR = '/etc/pve/nodes';
+
 sub api { return 11; }
 
 sub type { return 'dpx-vstor'; }
@@ -67,17 +69,18 @@ sub _guests_using_storage {
         for my $vmid (sort keys %$ids) {
             my $d = $ids->{$vmid};
             my $dir = ($d->{type} // '') eq 'lxc' ? 'lxc' : 'qemu-server';
-            push @confs, [$vmid, "/etc/pve/nodes/$d->{node}/$dir/$vmid.conf"];
+            push @confs, [$vmid, "$NODES_DIR/$d->{node}/$dir/$vmid.conf"];
         }
     } else {
-        for my $f (glob('/etc/pve/nodes/*/qemu-server/*.conf'), glob('/etc/pve/nodes/*/lxc/*.conf')) {
+        for my $f (glob("$NODES_DIR/*/qemu-server/*.conf"), glob("$NODES_DIR/*/lxc/*.conf")) {
             my ($vmid) = $f =~ m!/(\d+)\.conf$! or next;
             push @confs, [$vmid, $f];
         }
     }
     for my $c (@confs) {
         my ($vmid, $file) = @$c;
-        open(my $fh, '<', $file) or next;
+        next unless -e $file;
+        open(my $fh, '<', $file) or die "dpx-vstor: cannot read $file: $!\n";
         while (my $line = <$fh>) {
             next if $line =~ /^\s*#/;
             my ($val) = $line =~ /^[^:\s]+:\s*(.*)$/ or next;
