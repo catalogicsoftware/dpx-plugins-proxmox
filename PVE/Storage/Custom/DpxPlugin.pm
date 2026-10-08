@@ -4,7 +4,6 @@ package PVE::Storage::Custom::DpxPlugin;
 
 use strict;
 use warnings;
-use PVE::Cluster;
 use base qw(PVE::Storage::NFSPlugin);
 
 our $NODES_DIR = '/etc/pve/nodes';
@@ -37,61 +36,31 @@ sub filesystem_path {
 sub alloc_image { die "dpx-vstor: images are read-only restore sources\n" }
 
 sub free_image {
-    my ($class, $storeid, $scfg, $volname, @rest) = @_;
-    my ($vtype) = $class->parse_volname($volname);
-    return undef if $vtype eq 'images';
-    return $class->SUPER::free_image($storeid, $scfg, $volname, @rest);
+    my ($class, @a) = @_;
+    return undef if ($class->parse_volname($a[2]))[0] eq 'images';
+    return $class->SUPER::free_image(@a);
 }
 
 sub volume_has_feature {
-    my ($class, $scfg, $feature, $storeid, $volname, @rest) = @_;
-    my ($vtype) = $class->parse_volname($volname);
-    return undef
-        if $vtype eq 'images' && $feature =~ /^(?:clone|rename|snapshot)$/;
-    return $class->SUPER::volume_has_feature($scfg, $feature, $storeid, $volname, @rest);
+    my ($class, @a) = @_;
+    return undef if ($class->parse_volname($a[3]))[0] eq 'images' && $a[1] =~ /^(?:clone|rename|snapshot)$/;
+    return $class->SUPER::volume_has_feature(@a);
 }
 
 sub create_base {
-    my ($class, $storeid, $scfg, $volname) = @_;
-    my ($vtype) = $class->parse_volname($volname);
+    my ($class, @a) = @_;
     die "dpx-vstor: an instant-restore disk cannot become a template - move it to another storage first\n"
-        if $vtype eq 'images';
-    return $class->SUPER::create_base($storeid, $scfg, $volname);
+        if ($class->parse_volname($a[2]))[0] eq 'images';
+    return $class->SUPER::create_base(@a);
 }
 
 sub _guests_using_storage {
     my ($storeid) = @_;
-    my @users;
-    my $vmlist = PVE::Cluster::get_vmlist();
-    my $ids = ($vmlist && $vmlist->{ids}) ? $vmlist->{ids} : {};
-    my @confs;
-    if (%$ids) {
-        for my $vmid (sort keys %$ids) {
-            my $d = $ids->{$vmid};
-            my $dir = ($d->{type} // '') eq 'lxc' ? 'lxc' : 'qemu-server';
-            push @confs, [$vmid, "$NODES_DIR/$d->{node}/$dir/$vmid.conf"];
-        }
-    } else {
-        for my $f (glob("$NODES_DIR/*/qemu-server/*.conf"), glob("$NODES_DIR/*/lxc/*.conf")) {
-            my ($vmid) = $f =~ m!/(\d+)\.conf$! or next;
-            push @confs, [$vmid, $f];
-        }
-    }
-    for my $c (@confs) {
-        my ($vmid, $file) = @$c;
-        next unless -e $file;
-        open(my $fh, '<', $file) or die "dpx-vstor: cannot read $file: $!\n";
-        while (my $line = <$fh>) {
-            next if $line =~ /^\s*#/;
-            my ($val) = $line =~ /^[^:\s]+:\s*(.*)$/ or next;
-            if ($val =~ /(?:^|[,=])\Q$storeid\E:/) {
-                push @users, $vmid;
-                last;
-            }
-        }
-        close($fh);
-    }
-    return @users;
+    return map { m!/(\d+)\.conf$! } grep {
+        open(my $fh, '<', $_) or die "dpx-vstor: cannot read $_: $!\n";
+        local $/;
+        <$fh> =~ /^[^#:\s][^:\s]*:[ \t]*(?:.*[,=])?\Q$storeid\E:/m;
+    } glob("$NODES_DIR/*/{qemu-server,lxc}/*.conf");
 }
 
 sub properties {
@@ -145,10 +114,8 @@ sub on_delete_hook {
     my ($class, $storeid, $scfg) = @_;
 
     my @users = _guests_using_storage($storeid);
-    die "dpx-vstor: storage '$storeid' is still used by guest(s) "
-        . join(', ', @users)
-        . " - move their disks to another storage or destroy them first\n"
-        if @users;
+    die "dpx-vstor: storage '$storeid' is still used by guest(s) " . join(', ', @users)
+        . " - move their disks to another storage or destroy them first\n" if @users;
 
     my $path = "/mnt/pve/$storeid";
     unless (system('umount', $path) == 0) {
