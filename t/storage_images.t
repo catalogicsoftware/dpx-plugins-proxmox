@@ -2,7 +2,7 @@
 # Copyright (C) 2026 Catalogic Software, Inc.
 use strict;
 use warnings;
-use Test::More tests => 18;
+use Test::More;
 use File::Temp qw(tempdir);
 use File::Path qw(make_path);
 
@@ -77,3 +77,5 @@ SKIP: {
     like($@, qr/cannot read \Q$locked\E/, 'the storage delete is refused while a config cannot be read');
 }
 chmod(0600, $locked);
+
+done_testing;

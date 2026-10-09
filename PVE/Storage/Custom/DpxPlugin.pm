@@ -35,23 +35,28 @@ sub filesystem_path {
 
 sub alloc_image { die "dpx-vstor: images are read-only restore sources\n" }
 
+sub _is_image {
+    my ($class, $volname) = @_;
+    return ($class->parse_volname($volname))[0] eq 'images';
+}
+
 sub free_image {
-    my ($class, @a) = @_;
-    return undef if ($class->parse_volname($a[2]))[0] eq 'images';
-    return $class->SUPER::free_image(@a);
+    my ($class, $storeid, $scfg, $volname) = @_;
+    return undef if $class->_is_image($volname);
+    return $class->SUPER::free_image(@_[1 .. $#_]);
 }
 
 sub volume_has_feature {
-    my ($class, @a) = @_;
-    return undef if ($class->parse_volname($a[3]))[0] eq 'images' && $a[1] =~ /^(?:clone|rename|snapshot)$/;
-    return $class->SUPER::volume_has_feature(@a);
+    my ($class, $scfg, $feature, $storeid, $volname) = @_;
+    return undef if $class->_is_image($volname) && $feature =~ /^(?:clone|rename|snapshot)$/;
+    return $class->SUPER::volume_has_feature(@_[1 .. $#_]);
 }
 
 sub create_base {
-    my ($class, @a) = @_;
+    my ($class, $storeid, $scfg, $volname) = @_;
     die "dpx-vstor: an instant-restore disk cannot become a template - move it to another storage first\n"
-        if ($class->parse_volname($a[2]))[0] eq 'images';
-    return $class->SUPER::create_base(@a);
+        if $class->_is_image($volname);
+    return $class->SUPER::create_base(@_[1 .. $#_]);
 }
 
 sub _guests_using_storage {
