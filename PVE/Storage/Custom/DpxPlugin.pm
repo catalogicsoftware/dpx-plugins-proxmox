@@ -6,13 +6,15 @@ use strict;
 use warnings;
 use base qw(PVE::Storage::NFSPlugin);
 
+our $NODES_DIR = '/etc/pve/nodes';
+
 sub api { return 11; }
 
 sub type { return 'dpx-vstor'; }
 
 sub plugindata {
     return {
-        content  => [{ backup => 1 }, { backup => 1 }],
+        content  => [{ backup => 1, images => 1 }, { backup => 1 }],
         features => { 'backup-provider' => 1 },
     };
 }
@@ -21,6 +23,50 @@ sub activate_volume    { return 1; }
 sub deactivate_volume  { return 1; }
 sub list_volumes       { return []; }
 sub status             { return (0, 0, 0, 1); }
+
+sub filesystem_path {
+    my ($class, $scfg, $volname, $snapname) = @_;
+    my ($vtype, $name, $vmid) = $class->parse_volname($volname);
+    return $class->SUPER::filesystem_path($scfg, $volname, $snapname) if $vtype ne 'images';
+    my ($src, $stem) = $name =~ /^(\d+)-(.+)$/ or die "dpx-vstor: bad image name '$name'\n";
+    my $path = "$scfg->{path}/vm-$src/$stem";
+    return wantarray ? ($path, $vmid, $vtype) : $path;
+}
+
+sub alloc_image { die "dpx-vstor: images are read-only restore sources\n" }
+
+sub _is_image {
+    my ($class, $volname) = @_;
+    return ($class->parse_volname($volname))[0] eq 'images';
+}
+
+sub free_image {
+    my ($class, $storeid, $scfg, $volname) = @_;
+    return undef if $class->_is_image($volname);
+    return $class->SUPER::free_image(@_[1 .. $#_]);
+}
+
+sub volume_has_feature {
+    my ($class, $scfg, $feature, $storeid, $volname) = @_;
+    return undef if $class->_is_image($volname) && $feature =~ /^(?:clone|rename|snapshot)$/;
+    return $class->SUPER::volume_has_feature(@_[1 .. $#_]);
+}
+
+sub create_base {
+    my ($class, $storeid, $scfg, $volname) = @_;
+    die "dpx-vstor: an instant-restore disk cannot become a template - move it to another storage first\n"
+        if $class->_is_image($volname);
+    return $class->SUPER::create_base(@_[1 .. $#_]);
+}
+
+sub _guests_using_storage {
+    my ($storeid) = @_;
+    return map { m!/(\d+)\.conf$! } grep {
+        open(my $fh, '<', $_) or die "dpx-vstor: cannot read $_: $!\n";
+        local $/;
+        <$fh> =~ /^[^#:\s][^:\s]*:[ \t]*(?:.*[,=])?\Q$storeid\E:/m;
+    } glob("$NODES_DIR/*/{qemu-server,lxc}/*.conf");
+}
 
 sub properties {
     return {
@@ -71,6 +117,10 @@ sub new_backup_provider {
 # Unmount and remove the mount point here so per-run ids stay reusable.
 sub on_delete_hook {
     my ($class, $storeid, $scfg) = @_;
+
+    my @users = _guests_using_storage($storeid);
+    die "dpx-vstor: storage '$storeid' is still used by guest(s) " . join(', ', @users)
+        . " - move their disks to another storage or destroy them first\n" if @users;
 
     my $path = "/mnt/pve/$storeid";
     unless (system('umount', $path) == 0) {
