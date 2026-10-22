@@ -602,6 +602,7 @@ sub restore_vm_init {
 
     my $storage_path = $self->{scfg}{path}
         or die "DpxPlugin: no path in scfg (NFS not mounted?)";
+    $self->_activate_storage();
     _assert_mounted($storage_path);
     my $vm_dir = "$storage_path/vm-$source_vmid";
 
@@ -679,9 +680,27 @@ sub archive_get_firewall_config {
     return undef;
 }
 
+# The catalog registers the restore storage through whichever cluster member
+# DPX talks to, and PVE mounts a new storage only on the node that served that
+# API call. When the restore targets another member, nothing has mounted the
+# share there yet, so activate it here, on the node running qmrestore, the way
+# vzdump activates the target storage before a backup. Idempotent when the
+# share is already mounted; dies if the storage is disabled on this node or
+# its NFS server is unreachable.
+sub _activate_storage {
+    my ($self) = @_;
+    require PVE::Storage;
+    eval { PVE::Storage::activate_storage(PVE::Storage::config(), $self->{storeid}) };
+    die "DpxPlugin: cannot activate storage '$self->{storeid}': $@" if $@;
+    return 1;
+}
+
+# --mountpoint, not --target: --target resolves an unmounted directory to the
+# filesystem that contains it (usually /), so it never fails once the
+# directory exists.
 sub _assert_mounted {
     my ($path) = @_;
-    my $out = `findmnt --target "$path" 2>/dev/null`;
+    my $out = `findmnt --mountpoint "$path" 2>/dev/null`;
     die "DpxPlugin: path '$path' is not a mountpoint (NFS not mounted?)"
         unless defined $out && $out =~ /\S/;
     return 1;
